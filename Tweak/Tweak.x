@@ -55,8 +55,14 @@ static void miosStartWatchdog(void);
 
 // MARK: - Private declarations
 
-// DeviceCheck (DCDevice) and App Attest (DCAppAttestService) are intentionally NOT declared or
-// hooked anywhere — removed completely to match Blaze, which touches neither.
+// DeviceCheck (DCDevice). Hooked per-container (enableSpoofDeviceCheck) so each container does not
+// hand Apple's hardware-attested device token to the app — otherwise every container on one phone
+// attests as the same physical device. Declared here (DeviceCheck.framework is resolved at runtime).
+@interface DCDevice : NSObject
++ (instancetype)currentDevice;
++ (BOOL)isSupported;
+- (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion;
+@end
 
 // Keychain-wrapper classes that Instagram / the Facebook SDK use. On a sideloaded (resigned)
 // build they request a hard-coded keychain access group the app isn't entitled to, so SecItem
@@ -455,9 +461,28 @@ static CLLocation *spoofedLocationObject(void) {
     return %orig;
 }
 %end
-// DeviceCheck & App Attest are NOT hooked at all — removed completely to match Blaze, which
-// does not touch either (it doesn't even link DeviceCheck.framework). DCDevice/DCAppAttestService
-// run exactly as on a clean build.
+// DeviceCheck (DCDevice) — per-container toggle (enableSpoofDeviceCheck). When on, report the
+// device as not DeviceCheck-capable and never produce a token, so the app cannot send Apple's
+// hardware-attested per-device bits that would tie this container to the real physical device.
+// (App Attest / DCAppAttestService is still left untouched — it refuses to attest a resigned app
+// anyway, and failing it loudly is worse than not using it.)
+%hook DCDevice
++ (BOOL)isSupported {
+    if (spoofBool(@"enableSpoofDeviceCheck")) return NO;
+    return %orig;
+}
+- (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) {
+            NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1
+                                           userInfo:@{NSLocalizedDescriptionKey: @"DeviceCheck unavailable"}];
+            completion(nil, err);
+        }
+        return;
+    }
+    %orig;
+}
+%end
 
 // Network diagnostics. Logs every outbound NSURLSession request. During the registration
 // spinner the LAST few NET lines show which endpoint the app is hitting and whether it's
@@ -792,8 +817,14 @@ static void miosProbeDeviceHeaders(void) {
             id svc = it[(__bridge id)kSecAttrService], acct = it[(__bridge id)kSecAttrAccount];
             id lbl = it[(__bridge id)kSecAttrLabel];
             if (!(miosStrDeviceish(svc) || miosStrDeviceish(acct) || miosStrDeviceish(lbl))) continue;
-            BOOL isolated = [svc isKindOfClass:[NSString class]] && gKcPrefix.length &&
-                            [(NSString *)svc hasPrefix:gKcPrefix];
+            BOOL isSvcStr = [svc isKindOfClass:[NSString class]];
+            BOOL isolated = isSvcStr && gKcPrefix.length && [(NSString *)svc hasPrefix:gKcPrefix];
+            // An item prefixed with __mios_<other-uuid>_ belongs to ANOTHER container — it is
+            // isolated, just not this one's. Only a service with NO __mios_ prefix is truly shared.
+            BOOL otherContainer = isSvcStr && !isolated && [(NSString *)svc hasPrefix:@"__mios_"];
+            NSString *nsLabel = isolated ? @"THIS-container(prefixed)"
+                              : otherContainer ? @"OTHER-container(isolated)"
+                              : @"TRULY-SHARED(no __mios_ prefix)";
             id val = it[(__bridge id)kSecValueData];
             NSString *vs = nil;
             if ([val isKindOfClass:[NSData class]]) {
@@ -805,7 +836,7 @@ static void miosProbeDeviceHeaders(void) {
                 if (vs.length > 300) vs = [[vs substringToIndex:300] stringByAppendingString:@"…"];
             }
             NSLog(@"[miOS-kc] DEVICE-HEADER item service=%@ acct=%@ label=%@ namespace=%@ value=%@",
-                  svc, acct, lbl, isolated ? @"THIS-container(prefixed)" : @"SHARED/un-prefixed", vs);
+                  svc, acct, lbl, nsLabel, vs);
         }
     }
     NSLog(@"[miOS-kc] device-header probe complete (kcPrefix=%@)", gKcPrefix);
@@ -2328,6 +2359,10 @@ static NSString *miosRewriteUA(NSString *ua) {
         // (Device spoof cache, real-device capture, and the sysctl/uname/MGCopyAnswer hooks were
         // installed FIRST, above — see "DEVICE SPOOF FIRST" — before FS/keychain, to shrink the
         // pre-read window.)
+
+        // Ensure DeviceCheck.framework is loaded so the %hook DCDevice below resolves the class at
+        // %init even if the app links it lazily (the hook self-gates on enableSpoofDeviceCheck).
+        dlopen("/System/Library/Frameworks/DeviceCheck.framework/DeviceCheck", RTLD_LAZY);
 
         // Bind the remaining always-on ObjC hooks (UIDevice/NSProcessInfo/UIScreen/network/etc. —
         // each self-gates with its own spoofBool(...) check).
