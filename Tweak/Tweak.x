@@ -2403,7 +2403,7 @@ static NSString *miosRewriteUA(NSString *ua) {
         // may be silent (wrong class name / class not loaded / IG uses the C builders instead).
         @try {
             NSLog(@"[miOS-ua] _TtC11IGUserAgent11IGUserAgent class = %p",
-                  (void *)objc_getClass("_TtC11IGUserAgent11IGUserAgent"));
+                  (__bridge void *)objc_getClass("_TtC11IGUserAgent11IGUserAgent"));
             unsigned int ncls = 0; Class *all = objc_copyClassList(&ncls);
             int logged = 0;
             for (unsigned int i = 0; i < ncls && logged < 40; i++) {
