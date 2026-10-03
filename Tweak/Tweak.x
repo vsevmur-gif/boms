@@ -580,6 +580,38 @@ static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
 static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
 static OSStatus (*orig_SecItemDelete)(CFDictionaryRef);
 
+// --- Keychain diagnostics (aimed at IG's device header / FB_FINGERPRINT) ------------------------
+// kcModify isolates a keychain item ONLY when it carries kSecAttrService. If IG stores its device
+// header keyed by account / server / label with NO service, our namespace never touches it and
+// every container shares ONE header (the "same device across containers" symptom). These logs
+// show, per call, how each item is keyed and whether it is actually isolated. Always-on but
+// capped, so it is visible in Console / idevicesyslog without a MIOS_DIAG rebuild. Filter by
+// "miOS-kc".
+static BOOL miosStrDeviceish(id s) {
+    if (![s isKindOfClass:[NSString class]]) return NO;
+    NSString *l = [(NSString *)s lowercaseString];
+    for (NSString *needle in @[@"device", @"header", @"fingerprint", @"pigeon", @"familydevice",
+                               @"waterfall", @"bedrock", @"machineid", @"deviceid", @"device_id", @"mid"])
+        if ([l containsString:needle]) return YES;
+    return NO;
+}
+static void miosLogSecItem(const char *op, CFDictionaryRef dict) {
+    static int n = 0; if (n >= 400) return; n++;
+    @try {
+        NSDictionary *d = dict ? (__bridge NSDictionary *)dict : @{};
+        id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
+        id srv = d[(__bridge id)kSecAttrServer],  grp  = d[(__bridge id)kSecAttrAccessGroup];
+        id lbl = d[(__bridge id)kSecAttrLabel],   cls  = d[(__bridge id)kSecClass];
+        BOOL hasSvc = [svc isKindOfClass:[NSString class]] && [(NSString *)svc length] > 0;
+        BOOL deviceish = miosStrDeviceish(svc) || miosStrDeviceish(acct) ||
+                         miosStrDeviceish(srv) || miosStrDeviceish(lbl);
+        NSLog(@"[miOS-kc] %s class=%@ service=%@ acct=%@ server=%@ grp=%@ label=%@ isolated=%@%@",
+              op, cls, svc, acct, srv, grp, lbl,
+              hasSvc ? @"YES(service-keyed)" : @"NO(not service-keyed -> SHARED across containers)",
+              deviceish ? @"  <== DEVICE-HEADER-LIKE" : @"");
+    } @catch (__unused id e) {}
+}
+
 // MARK: - Keychain per-container isolation (Blaze-style: prefix kSecAttrService only)
 //
 // EXACTLY how Blaze does it (verified by disassembling its modifyAttributesForProfile): every
@@ -597,23 +629,22 @@ static NSDictionary *kcModify(CFDictionaryRef dict) {
     return m;
 }
 static OSStatus new_SecItemAdd(CFDictionaryRef a, CFTypeRef *r) {
+    miosLogSecItem("ADD ", a);
     if (gKcPrefix.length == 0) return orig_SecItemAdd(a, r);
     return orig_SecItemAdd((__bridge CFDictionaryRef)kcModify(a), r);
 }
 static OSStatus new_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
+    miosLogSecItem("COPY", q);
     if (gKcPrefix.length == 0) return orig_SecItemCopyMatching(q, r);
-    static int gKcQLog = 0;
-    if (gKcQLog < 30) { gKcQLog++;
-        NSDictionary *qq = (__bridge NSDictionary *)q;
-        NSLog(@"[miOS-iso] SecItemCopyMatching ENGAGED service=%@ class=%@ kcPrefix=%@",
-              qq[(__bridge id)kSecAttrService], qq[(__bridge id)kSecClass], gKcPrefix); }
     return orig_SecItemCopyMatching((__bridge CFDictionaryRef)kcModify(q), r);
 }
 static OSStatus new_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef u) {
+    miosLogSecItem("UPD ", q);
     if (gKcPrefix.length == 0) return orig_SecItemUpdate(q, u);
     return orig_SecItemUpdate((__bridge CFDictionaryRef)kcModify(q), u);
 }
 static OSStatus new_SecItemDelete(CFDictionaryRef q) {
+    miosLogSecItem("DEL ", q);
     if (gKcPrefix.length == 0) return orig_SecItemDelete(q);
     return orig_SecItemDelete((__bridge CFDictionaryRef)kcModify(q));
 }
@@ -684,6 +715,50 @@ void miosWipeContainerKeychain(NSString *containerID) {
         }
     }
     NSLog(@"[miOS-iso] miosWipeContainerKeychain done for id=%@ (prefix=%@)", containerID, prefix);
+}
+
+// One-shot dump of device-header-like keychain items, WITH their stored value and whether each one
+// lives in THIS container's namespace (service carries our prefix) or in the shared, un-prefixed
+// keychain. Reads raw via the ORIGINAL SecItem. Only items whose service/account/label look
+// device-related are printed, so login tokens are not dumped. This is the decisive answer to "is
+// the device header shared across containers?": if a device-header item prints
+// namespace=SHARED/un-prefixed, every container reads the same one. Filter Console by "miOS-kc".
+static void miosProbeDeviceHeaders(void) {
+    if (!orig_SecItemCopyMatching) return;
+    for (id cls in @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword]) {
+        NSDictionary *q = @{ (__bridge id)kSecClass:              cls,
+                             (__bridge id)kSecMatchLimit:         (__bridge id)kSecMatchLimitAll,
+                             (__bridge id)kSecReturnAttributes:   @YES,
+                             (__bridge id)kSecReturnData:         @YES,
+                             (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny };
+        CFTypeRef res = NULL;
+        if (orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, &res) != errSecSuccess || !res) {
+            if (res) CFRelease(res);
+            continue;
+        }
+        NSArray *items = (__bridge_transfer NSArray *)res;
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            id svc = it[(__bridge id)kSecAttrService], acct = it[(__bridge id)kSecAttrAccount];
+            id lbl = it[(__bridge id)kSecAttrLabel];
+            if (!(miosStrDeviceish(svc) || miosStrDeviceish(acct) || miosStrDeviceish(lbl))) continue;
+            BOOL isolated = [svc isKindOfClass:[NSString class]] && gKcPrefix.length &&
+                            [(NSString *)svc hasPrefix:gKcPrefix];
+            id val = it[(__bridge id)kSecValueData];
+            NSString *vs = nil;
+            if ([val isKindOfClass:[NSData class]]) {
+                NSData *dv = val;
+                vs = [[NSString alloc] initWithData:dv encoding:NSUTF8StringEncoding];
+                if (!vs) vs = [NSString stringWithFormat:@"<%lu bytes, hex head=%@>",
+                               (unsigned long)dv.length,
+                               [dv subdataWithRange:NSMakeRange(0, MIN((NSUInteger)24, dv.length))]];
+                if (vs.length > 300) vs = [[vs substringToIndex:300] stringByAppendingString:@"…"];
+            }
+            NSLog(@"[miOS-kc] DEVICE-HEADER item service=%@ acct=%@ label=%@ namespace=%@ value=%@",
+                  svc, acct, lbl, isolated ? @"THIS-container(prefixed)" : @"SHARED/un-prefixed", vs);
+        }
+    }
+    NSLog(@"[miOS-kc] device-header probe complete (kcPrefix=%@)", gKcPrefix);
 }
 
 // MARK: - Container filesystem isolation (CFFIXED_USER_HOME + home-API hooks)
@@ -1784,6 +1859,12 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                          containerURLForSecurityApplicationGroupIdentifier:@"group.com.burbn.instagram"];
             NSLog(@"[miOS-iso] app-group url -> %@", ag.path);
         });
+        // Device-header keychain probe: ~1s in (what's stored at launch) and again at ~6s (after IG
+        // has had a chance to read/create its header this session). Shows value + whether isolated.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ miosProbeDeviceHeaders(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ miosProbeDeviceHeaders(); });
 
         // 3. First-launch App-Group wipe.
         miosResetContainerCachesOnce(gContainerUUID);
