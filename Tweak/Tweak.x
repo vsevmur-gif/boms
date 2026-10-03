@@ -2185,6 +2185,34 @@ static NSString *miosRewriteUA(NSString *ua) {
         NSLog(@"[miOS-ua] rewrote User-Agent -> %@", out);
     return out;
 }
+
+// FBSharedFramework C UA builders (confirmed present via dlsym). METAGenerateInstagramStyleUser-
+// AgentInfoString builds the device part "(iPhone17,1; iOS 18_5; Scale/3.00)" of IG's UA — IG does
+// NOT use -[IGUserAgent userAgent] (our ObjC hook never fired), it goes through these. Rewrite the
+// returned string. Args are passed through as up to 4 pointers (a UA builder takes 0-few pointer
+// args); when nothing matches, miosRewriteUA returns the original pointer unchanged (no ARC/owner
+// risk). METAUserAgentInfoDefaultValue is a DATA symbol (different segment), so it is NOT hooked.
+static NSString *(*orig_METAGenUA)(void *, void *, void *, void *) = NULL;
+static NSString *hook_METAGenUA(void *a0, void *a1, void *a2, void *a3) {
+    NSString *r = orig_METAGenUA(a0, a1, a2, a3);
+    if (!gDeviceSpoofActive || ![r isKindOfClass:[NSString class]]) return r;
+    static int lg = 0; if (lg < 4) { lg++; NSLog(@"[miOS-ua] METAGenerate in=%@", r); }
+    return miosRewriteUA(r);
+}
+static NSString *(*orig_METAWKUA)(void *, void *, void *, void *) = NULL;
+static NSString *hook_METAWKUA(void *a0, void *a1, void *a2, void *a3) {
+    NSString *r = orig_METAWKUA(a0, a1, a2, a3);
+    if (!gDeviceSpoofActive || ![r isKindOfClass:[NSString class]]) return r;
+    static int lg = 0; if (lg < 4) { lg++; NSLog(@"[miOS-ua] METAGetWKWebViewUA in=%@", r); }
+    return miosRewriteUA(r);
+}
+static NSString *(*orig_METAWKUADef)(void *, void *, void *, void *) = NULL;
+static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
+    NSString *r = orig_METAWKUADef(a0, a1, a2, a3);
+    if (!gDeviceSpoofActive || ![r isKindOfClass:[NSString class]]) return r;
+    return miosRewriteUA(r);
+}
+
 // IGUserAgent singleton — rewrite the composed UA at its source (timing-independent, defeats a
 // cached real-model UA). This is the string that registers the login session's device.
 %hook _TtC11IGUserAgent11IGUserAgent
@@ -2355,6 +2383,13 @@ static NSString *miosRewriteUA(NSString *ua) {
                     {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
                 }, 1);
             NSLog(@"[miOS-time] device hooks INSTALLED @%.0fms (early, before FS/keychain)", miosMsSinceStart());
+            // FBSharedFramework UA builders — the model in IG's UA comes from here, not the ObjC
+            // getter. Rewrite the device/model/iOS in the returned string, timing-independent.
+            rebind_symbols((struct rebinding[]){
+                {"METAGenerateInstagramStyleUserAgentInfoString", (void *)hook_METAGenUA,    (void **)&orig_METAGenUA},
+                {"METAGetWKWebViewUserAgent",                     (void *)hook_METAWKUA,     (void **)&orig_METAWKUA},
+                {"METAWKWebViewDefaultUserAgentForCurrentApp",    (void *)hook_METAWKUADef,  (void **)&orig_METAWKUADef},
+            }, 3);
         }
 
         // 1. Filesystem isolation first.
