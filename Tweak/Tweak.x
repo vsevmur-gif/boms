@@ -113,7 +113,6 @@ static CFStringRef gcMGProductType    = NULL;
 static CFStringRef gcMGHWModel        = NULL;
 static CFStringRef gcMGDeviceName     = NULL;
 static CFStringRef gcMGProductVersion = NULL;
-static CFTypeRef (*gRealMGCopyAnswer)(CFStringRef) = NULL;
 
 // Real device values captured BEFORE any hook is installed — used to rewrite outgoing telemetry
 // (NSJSONSerialization) so the real model/iOS can't leak into IG's login/device payload even if
@@ -1007,160 +1006,6 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
     return r;
 }
 
-// MARK: - MGCopyAnswer (MobileGestalt) — hook the INTERNAL implementation (iOS 15.7–16.7)
-//
-// Robust device-model / iOS-version spoofing. The public `MGCopyAnswer(key)` is just a thin
-// thunk: `mov x1, #0` (clears the outTypeCode arg) then `B` into the real 2-argument internal
-// `MGCopyAnswer_internal(key, outTypeCode)`. Both the app's anti-fraud code AND system
-// frameworks (UIDevice, etc.) reach the internal, often bypassing the public symbol — so we
-// follow the branch and hook the INTERNAL function (technique from ryannair05/MGSpoof &
-// Lessica's iOS 15 gist). Falls back to hooking the public symbol if the prologue is unexpected.
-
-// Shared: the spoofed value for a MobileGestalt key, or NULL to pass through.
-static CFTypeRef miosMGSpoofedValue(CFStringRef key) {
-    if (!gDeviceSpoofActive || !key) return NULL;
-    if (gcMGProductType && CFEqual(key, CFSTR("ProductType")))              // e.g. iPhone14,2
-        return CFRetain(gcMGProductType);
-    if (gcMGHWModel && (CFEqual(key, CFSTR("HWModelStr")) ||                // board, e.g. D63AP
-                        CFEqual(key, CFSTR("HardwarePlatform"))))
-        return CFRetain(gcMGHWModel);
-    if (gcMGDeviceName && (CFEqual(key, CFSTR("DeviceName")) ||
-                           CFEqual(key, CFSTR("marketing-name")) ||
-                           CFEqual(key, CFSTR("UserAssignedDeviceName"))))
-        return CFRetain(gcMGDeviceName);
-    if (gcMGProductVersion && CFEqual(key, CFSTR("ProductVersion")))        // iOS version
-        return CFRetain(gcMGProductVersion);
-    return NULL;
-}
-// Public thunk replacement (1-arg) — fallback path.
-static CFTypeRef mios_MGCopyAnswer(CFStringRef key) {
-    CFTypeRef v = miosMGSpoofedValue(key);
-    if (v) return v;
-    return gRealMGCopyAnswer ? gRealMGCopyAnswer(key) : NULL;
-}
-// Internal implementation replacement (2-arg) — primary path.
-static CFTypeRef (*orig_MGCopyAnswer_internal)(CFStringRef, void *) = NULL;
-static CFTypeRef mios_MGCopyAnswer_internal(CFStringRef key, void *outTypeCode) {
-    CFTypeRef spoof = miosMGSpoofedValue(key);               // +1 CFString, or NULL
-    // Always let the real impl run so it sets *outTypeCode correctly (the caller may read it to
-    // decide how to interpret the return — a wrong/stale code on a spoofed CFString can crash). Our
-    // spoofed keys are all strings, so the real string type code matches our replacement.
-    CFTypeRef real = orig_MGCopyAnswer_internal ? orig_MGCopyAnswer_internal(key, outTypeCode) : NULL;
-    if (spoof) {
-        if (real) CFRelease(real);
-        return spoof;
-    }
-    return real;
-}
-// Public-symbol inline-hook replacement. Unlike the fishhook import rebind (which only redirects
-// an image's import pointers), MSHookFunction patches the REAL function bytes at MGCopyAnswer's
-// address — so it also catches callers that resolved the pointer via dlsym (anti-fraud/telemetry
-// SDKs do this to bypass import rebinding, which is why the app's login telemetry still saw the
-// real model while the sysctl-built User-Agent was already spoofed).
-static CFTypeRef (*orig_MGpub)(CFStringRef) = NULL;
-static CFTypeRef mios_MGpub(CFStringRef key) {
-    CFTypeRef v = miosMGSpoofedValue(key);
-    if (v) return v;
-    return orig_MGpub ? orig_MGpub(key) : NULL;
-}
-// NARROW, crash-safe dlsym interception — ONLY for "MGCopyAnswer". MSHookFunction is a no-op on
-// this sideload runtime, so this is the only way to make dlsym-resolved MGCopyAnswer callers
-// (IG's telemetry) see the spoofed device. The earlier GLOBAL dlsym hook crashed because (a) its
-// fallback called the (now-rebound) dlsym and recursed, and (b) it also returned our sysctl/uname
-// hooks, which get called during early init before their origs are ready. Both are fixed here:
-//   - g_real_dlsym is captured BEFORE rebinding and always used for the fallthrough (no recursion),
-//   - we intercept ONLY MGCopyAnswer, whose replacement (mios_MGpub) always has a valid real
-//     fallback (orig_MGpub, set explicitly at install time).
-static void *(*g_real_dlsym)(void *, const char *) = NULL;
-static void *mios_dlsym(void *handle, const char *symbol) {
-    if (symbol && gDeviceSpoofActive && orig_MGpub && strcmp(symbol, "MGCopyAnswer") == 0)
-        return (void *)mios_MGpub;
-    return g_real_dlsym ? g_real_dlsym(handle, symbol) : NULL;
-}
-
-// Real MGCopyAnswer address (captured before hooking) — the function Substitute inline-patches.
-static void *gMGRealAddr = NULL;
-
-// (MGCopyAnswerWithError is intentionally NOT hooked — uncertain iOS 18 ABI; a signature mismatch
-// corrupts the call and crashes. Only MGCopyAnswer's import is rebound.)
-
-// Old Substitute (comex) can't safely inline-patch arm64e shared-cache system code (iPhone 16 Pro /
-// iOS 18): its trampoline faults → KERN_PROTECTION_FAILURE inside MGCopyAnswer_internal. So the
-// Substitute inline path is OFF by default. Only a PAC-aware hooker (ElleKit) can inline-hook here.
-static BOOL gUseSubstituteMG = NO;
-
-// Substitute inline hook (comex/substitute). substitute_hook_functions patches the function's
-// bytes in-process — it WORKS on sideload where MSHookFunction is a no-op — so dlsym/internal
-// MGCopyAnswer callers (IG's telemetry) get the spoofed device too, without needing ElleKit.
-// ABI mirrors <substitute.h>:
-//   struct substitute_function_hook { void *function; void *replacement; void **old_ptr; int options; };
-//   int substitute_hook_functions(const struct substitute_function_hook *, size_t, void **recordp, int options);
-struct mios_sub_hook { void *function; void *replacement; void **old_ptr; int options; };
-typedef int (*mios_sub_hook_fn)(const struct mios_sub_hook *, size_t, void **, int);
-static void *miosFindMGInternal(const void *pub);   // defined below
-static BOOL miosInstallMGViaSubstitute(void) {
-    if (!(gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel)) return NO;
-    void *lh = dlopen("@loader_path/libsubstitute.0.dylib", RTLD_NOW);
-    if (!lh) lh = dlopen("@executable_path/Frameworks/libsubstitute.0.dylib", RTLD_NOW);
-    if (!lh) lh = dlopen("@loader_path/libsubstitute.dylib", RTLD_NOW);
-    if (!lh) lh = dlopen("libsubstitute.0.dylib", RTLD_NOW);
-    if (!lh) lh = dlopen("libsubstitute.dylib", RTLD_NOW);
-    if (!lh) { NSLog(@"[miOS-iso] Substitute: dlopen failed (bundle libsubstitute.0.dylib in Frameworks/)"); return NO; }
-    mios_sub_hook_fn hookfn = (mios_sub_hook_fn)dlsym(lh, "substitute_hook_functions");
-    if (!hookfn) { NSLog(@"[miOS-iso] Substitute: no substitute_hook_functions symbol"); return NO; }
-
-    if (!gMGRealAddr) return NO;
-    // Hook the INTERNAL MGCopyAnswer (known 2-arg signature: key, outTypeCode). Both public entry
-    // points — MGCopyAnswer (8-byte thunk) and MGCopyAnswerWithError — funnel through it, so this
-    // one safe hook covers them all. Never patch the short public thunk; skip if internal unresolved.
-    void *internal = NULL;
-    @try { internal = miosFindMGInternal(gMGRealAddr); } @catch (__unused id e) { internal = NULL; }
-    if (!internal || internal == gMGRealAddr) {
-        NSLog(@"[miOS-iso] Substitute: internal MGCopyAnswer not resolved — skipping (won't patch short thunk)");
-        return NO;
-    }
-    struct mios_sub_hook h = { internal, (void *)mios_MGCopyAnswer_internal, (void **)&orig_MGCopyAnswer_internal, 0 };
-    int r = hookfn(&h, 1, NULL, 0);
-    NSLog(@"[miOS-iso] Substitute MGCopyAnswer_internal inline-hook @%p -> %d (0=OK)", internal, r);
-    return r == 0;
-}
-// Strip PAC from a code pointer so we can read its instruction bytes (no-op on plain arm64).
-static const uint8_t *miosStripPAC(const void *p) {
-#if __has_feature(ptrauth_calls)
-    return (const uint8_t *)ptrauth_strip(p, ptrauth_key_function_pointer);
-#else
-    return (const uint8_t *)p;
-#endif
-}
-// Follow an ARM64 B instruction at `pc` to its target address.
-static const uint8_t *miosFollowB(const uint8_t *pc) {
-    uint32_t ins = *(const uint32_t *)pc;
-    int64_t imm = ins & 0x03FFFFFF;      // 26-bit signed
-    imm = (imm << 38) >> 38;             // sign-extend
-    return pc + (imm << 2);
-}
-// Given the public MGCopyAnswer thunk, return the internal implementation address, or NULL.
-static void *miosFindMGInternal(const void *pub) {
-    const uint8_t *p = miosStripPAC(pub);
-    // Expected thunk prologue: mov x1, #0  ==  01 00 80 d2
-    if (p[0] == 0x01 && p[1] == 0x00 && p[2] == 0x80 && p[3] == 0xd2) {
-        uint32_t b = *(const uint32_t *)(p + 4);
-        if ((b & 0xFC000000) == 0x14000000) {           // it's a B
-            if ((b & 0x03FFFFFF) == 1) return (void *)(p + 8);   // legacy: B #4 → internal at +8
-            return (void *)miosFollowB(p + 4);                   // modern: follow the branch
-        }
-    }
-    // Fallback: first B within the first 16 bytes.
-    for (int i = 0; i < 16; i += 4) {
-        uint32_t ins = *(const uint32_t *)(p + i);
-        if ((ins & 0xFC000000) == 0x14000000) return (void *)miosFollowB(p + i);
-    }
-    return NULL;
-}
-// (The old MSHookFunction-based MGCopyAnswer hook was removed: MSHookFunction is a no-op on this
-// sideload substrate, and it targeted the 8-byte public thunk which crashes when patched. The
-// device telemetry read is now covered by Substitute inline-hooking the INTERNAL impl —
-// miosInstallMGViaSubstitute — plus the fishhook import rebind for linked callers.)
 
 // MARK: - Per-container HTTPS proxy (NSURLSessionConfiguration)
 
@@ -1871,25 +1716,17 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
             char v[128] = {0}; size_t vl = sizeof(v);
             if (sysctlbyname("kern.osproductversion", v, &vl, NULL, 0) == 0 && v[0])
                 gRealIOSNS = [NSString stringWithUTF8String:v];
-            // Capture the REAL dlsym now (before we rebind it) so the narrow dlsym hook's
-            // fallthrough can never recurse.
-            g_real_dlsym = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "dlsym");
             void *mgH = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
             if (mgH) {
                 CFTypeRef (*mg)(CFStringRef) = (CFTypeRef (*)(CFStringRef))dlsym(mgH, "MGCopyAnswer");
                 if (mg) {
-                    // Real MGCopyAnswer — the guaranteed fallback for mios_MGpub (so dlsym callers
-                    // of non-spoofed keys always get a valid value, never NULL) + the address
-                    // Substitute inline-patches.
-                    gMGRealAddr = (void *)mg;
-                    if (!orig_MGpub) orig_MGpub = (CFTypeRef (*)(CFStringRef))mg;
                     CFTypeRef fn = mg(CFSTR("marketing-name"));
                     if (fn && CFGetTypeID(fn) == CFStringGetTypeID()) gRealFriendlyNS = (__bridge_transfer NSString *)fn;
                     else if (fn) CFRelease(fn);
                 }
             }
-            NSLog(@"[miOS-iso] captured REAL device: machine=%@ ios=%@ friendly=%@ (dlsym=%p mgpub=%p)",
-                  gRealMachineNS, gRealIOSNS, gRealFriendlyNS, (void *)g_real_dlsym, (void *)orig_MGpub);
+            NSLog(@"[miOS-iso] captured REAL device: machine=%@ ios=%@ friendly=%@",
+                  gRealMachineNS, gRealIOSNS, gRealFriendlyNS);
         }
 
         // Bind the always-on hooks (device/identifier/network/etc. — each self-gates with
@@ -1903,40 +1740,16 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
         //   - sysctlbyname("hw.machine"/"hw.model")  — string-keyed sysctl
         //   - sysctl({CTL_HW, HW_MACHINE/HW_MODEL})  — array-keyed sysctl (IG uses this form too!)
         //   - uname()                                 — utsname.machine
-        //   - MGCopyAnswer (import)                   — linked MobileGestalt callers
-        //   - dlsym("MGCopyAnswer"/"sysctl*"/"uname") — runtime-resolved (anti-fraud bypass)
+        // MobileGestalt (MGCopyAnswer) is intentionally NOT hooked: the import rebind + Substitute
+        // inline + narrow dlsym hooks were removed because the process-wide dlsym rebind crashed
+        // the app on arm64e/iOS 18. Device model/version still spoof via sysctl/uname + the ObjC
+        // UIDevice/NSProcessInfo hooks.
         if (gDeviceSpoofActive) {
             rebind_symbols((struct rebinding[]){
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             }, 3);
-            // MobileGestalt: fishhook the public MGCopyAnswer import (what the app calls for
-            // ProductType/ProductVersion), plus a best-effort internal hook for system callers.
-            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel) {
-                // fishhook the MGCopyAnswer IMPORT — safe table rewrite (no code patching, no PAC
-                // issue), 1-arg signature is well-known. We deliberately do NOT rebind
-                // MGCopyAnswerWithError: its iOS 18 ABI is uncertain (likely >2 args), and a
-                // signature mismatch in the replacement corrupts the call → crash.
-                rebind_symbols((struct rebinding[]){
-                    {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&gRealMGCopyAnswer},
-                }, 1);
-                // Substitute inline-hook is OFF: old comex Substitute can't relocate the arm64e
-                // (PAC) prologue of system libMobileGestalt — it returns error 6 and corrupts the
-                // function → crash. Only a PAC-aware hooker (ElleKit) can inline-hook here.
-                if (gUseSubstituteMG) miosInstallMGViaSubstitute();
-                // NARROW dlsym hook for MGCopyAnswer ONLY. Since MSHookFunction is a no-op on this
-                // runtime, this is what actually makes IG's dlsym-resolved telemetry read return the
-                // spoofed model. Safe: captured g_real_dlsym avoids recursion, orig_MGpub is a valid
-                // real fallback, and we intercept nothing but "MGCopyAnswer". Pass NULL `replaced`
-                // so fishhook doesn't overwrite our manually-captured g_real_dlsym.
-                if (g_real_dlsym && orig_MGpub) {
-                    rebind_symbols((struct rebinding[]){
-                        {"dlsym", (void *)mios_dlsym, NULL},
-                    }, 1);
-                    NSLog(@"[miOS-iso] narrow dlsym(MGCopyAnswer) hook installed");
-                }
-            }
         }
 
         // getifaddrs — Wi-Fi + cellular IP spoofing (Blaze fishhooks this too).
@@ -1965,30 +1778,6 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                 sysctl(mib, 2, amch, &aml, NULL, 0);
                 NSLog(@"[miOS-iso] SELFTEST sysctl[CTL_HW,HW_MACHINE]=%s  (array-form C-hook %@)",
                       amch, (wantModel.length && strcmp(amch, wantModel.UTF8String) == 0) ? @"WORKS" : @"NOT firing");
-                // HONEST MGCopyAnswer test: call OUR replacement directly. This is exactly what
-                // IG sees, because fishhook rebinds the MGCopyAnswer import in every image to
-                // mios_MGCopyAnswer. (Calling via dlsym would resolve the REAL function address
-                // and bypass fishhook, so it always shows the real device — useless as a test.)
-                CFTypeRef pt = mios_MGCopyAnswer(CFSTR("ProductType"));
-                CFTypeRef pv = mios_MGCopyAnswer(CFSTR("ProductVersion"));
-                NSLog(@"[miOS-iso] SELFTEST MGCopyAnswer(ours) ProductType=%@ ProductVersion=%@  want model=%@ ios=%@",
-                      (__bridge id)pt, (__bridge id)pv, spoofStr(@"deviceIdentifier"), spoofStr(@"iosVersion"));
-                if (pt) CFRelease(pt);
-                if (pv) CFRelease(pv);
-                // DECISIVE: dlsym("MGCopyAnswer") now goes through our NARROW dlsym hook, so this
-                // must return SPOOFED — proving IG's dlsym-based telemetry device reads are spoofed.
-                void *mg = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
-                CFTypeRef(*mgfn)(CFStringRef) = mg ? (CFTypeRef(*)(CFStringRef))dlsym(mg, "MGCopyAnswer") : NULL;
-                if (mgfn) {
-                    CFTypeRef rpt = mgfn(CFSTR("ProductType"));
-                    NSLog(@"[miOS-iso] SELFTEST MGCopyAnswer(via dlsym) ProductType=%@  (dlsym-hook %@)",
-                          (__bridge id)rpt,
-                          (wantModel.length && [(__bridge id)rpt isEqual:wantModel]) ? @"WORKS — dlsym spoofed" : @"NOT firing — still real");
-                    if (rpt) CFRelease(rpt);
-                }
-                // (No raw MGCopyAnswerWithError probe — its iOS 18 ABI isn't the simple 2-arg form
-                // we assumed, and calling it directly crashed. The internal hook covers it; the
-                // MGCopyAnswer(via dlsym) line above already reflects whether the spoof reaches it.)
                 NSLog(@"[miOS-iso] SELFTEST UIDevice.systemVersion=%@ model=%@ (ObjC-hook path; enableSpoofSW=%d ios=%@)",
                       [UIDevice currentDevice].systemVersion, [UIDevice currentDevice].model,
                       (int)spoofBool(@"enableSpoofSoftwareVersion"), spoofStr(@"iosVersion"));
