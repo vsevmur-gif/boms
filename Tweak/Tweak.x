@@ -1508,8 +1508,28 @@ static NSString *miosWebSpoofJS(void) {
     } @catch (__unused id e) {}
     return %orig;
 }
+- (void)setCustomUserAgent:(NSString *)ua {
+    if (gDeviceSpoofActive && [ua isKindOfClass:[NSString class]] && ua.length > 0) {
+        NSString *rewritten = miosRewriteUA(ua);
+        NSLog(@"[miOS-ua] WKWebView setCustomUserAgent in=%@ out=%@", ua, rewritten);
+        %orig(rewritten);
+        return;
+    }
+    %orig;
+}
 - (void)loadRequest:(NSURLRequest *)request {
     NSLog(@"[miOS-web] WKWebView loadRequest %@", request.URL.absoluteString);
+    %orig;
+}
+%end
+%hook WKWebViewConfiguration
+- (void)setApplicationNameForUserAgent:(NSString *)name {
+    if (gDeviceSpoofActive && [name isKindOfClass:[NSString class]] && name.length > 0) {
+        NSString *rewritten = miosRewriteUA(name);
+        NSLog(@"[miOS-ua] WKWebViewConfig setApplicationNameForUserAgent in=%@ out=%@", name, rewritten);
+        %orig(rewritten);
+        return;
+    }
     %orig;
 }
 %end
@@ -2278,6 +2298,15 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
 - (NSString *)customUserAgent {
     NSString *ua = %orig;
     return gDeviceSpoofActive ? miosRewriteUA(ua) : ua;
+}
+- (void)setCustomUserAgent:(NSString *)ua {
+    if (gDeviceSpoofActive && [ua isKindOfClass:[NSString class]] && ua.length > 0) {
+        NSString *rewritten = miosRewriteUA(ua);
+        NSLog(@"[miOS-ua] IGUserAgent setCustomUserAgent in=%@ out=%@", ua, rewritten);
+        %orig(rewritten);
+        return;
+    }
+    %orig;
 }
 %end
 %hook NSMutableURLRequest
