@@ -1225,8 +1225,10 @@ static void miosScreenForIdentifier(NSString *ident, CGFloat *w, CGFloat *h, CGF
     static NSDictionary<NSString *, NSArray<NSNumber *> *> *map; static dispatch_once_t once;
     dispatch_once(&once, ^{
         map = @{
-            @"iPhone9,1":  @[@750,  @1334, @2],   // iPhone 7
-            @"iPhone10,1": @[@750,  @1334, @2],   // iPhone 8
+            @"iPhone9,1":  @[@750,  @1334, @2],       // iPhone 7
+            @"iPhone9,2":  @[@1080, @1920, @2.608],   // iPhone 7 Plus (downsampled from @3x)
+            @"iPhone10,1": @[@750,  @1334, @2],       // iPhone 8
+            @"iPhone10,2": @[@1080, @1920, @2.608],   // iPhone 8 Plus (downsampled from @3x)
             @"iPhone10,3": @[@1125, @2436, @3],   // iPhone X
             @"iPhone11,8": @[@828,  @1792, @2],   // iPhone XR
             @"iPhone11,2": @[@1125, @2436, @3],   // iPhone XS
