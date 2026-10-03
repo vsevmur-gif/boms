@@ -130,6 +130,7 @@ static CFStringRef gcMGProductType    = NULL;
 static CFStringRef gcMGHWModel        = NULL;
 static CFStringRef gcMGDeviceName     = NULL;
 static CFStringRef gcMGProductVersion = NULL;
+static CFStringRef gcMGDeviceClass    = NULL;   // "iPhone"/"iPad"/"iPod touch"
 
 // Real device values captured BEFORE any hook is installed — used to rewrite outgoing telemetry
 // (NSJSONSerialization) so the real model/iOS can't leak into IG's login/device payload even if
@@ -1103,6 +1104,30 @@ __attribute__((unused)) static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFS
     return orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(iface) : NULL;
 }
 
+// MARK: - MobileGestalt (MGCopyAnswer) — SAFE fishhook import rebind only
+//
+// The model IG shows in-app (and sends as device info) is the MobileGestalt marketing-name /
+// ProductType, NOT hw.machine — so spoofing sysctl alone leaves the real "iPhone 16 Pro" on
+// screen. We re-bind the MGCopyAnswer IMPORT (a plain pointer-table rewrite, no code patching, no
+// PAC, no dlsym) so linked callers — which is how IG resolves it — get the spoofed value. This is
+// the safe mechanism; the process-wide dlsym("MGCopyAnswer") rebind that crashed arm64e/iOS 18 and
+// the Substitute inline hook are intentionally NOT reinstated.
+static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef) = NULL;
+static CFTypeRef mios_MGCopyAnswer(CFStringRef key) {
+    if (gDeviceSpoofActive && key) {
+        if (gcMGProductType && CFEqual(key, CFSTR("ProductType")))      return CFRetain(gcMGProductType);
+        if (gcMGProductVersion && CFEqual(key, CFSTR("ProductVersion"))) return CFRetain(gcMGProductVersion);
+        if (gcMGHWModel && (CFEqual(key, CFSTR("HWModelStr")) || CFEqual(key, CFSTR("HardwarePlatform"))))
+            return CFRetain(gcMGHWModel);
+        if (gcMGDeviceName && (CFEqual(key, CFSTR("marketing-name")) ||
+                               CFEqual(key, CFSTR("DeviceName")) ||
+                               CFEqual(key, CFSTR("UserAssignedDeviceName"))))
+            return CFRetain(gcMGDeviceName);
+        if (gcMGDeviceClass && CFEqual(key, CFSTR("DeviceClass")))     return CFRetain(gcMGDeviceClass);
+    }
+    return orig_MGCopyAnswer ? orig_MGCopyAnswer(key) : NULL;
+}
+
 // getifaddrs: rewrite the IPv4 of en0 (Wi-Fi) and pdp_ip0 (cellular) if spoofing is on.
 static void miosRewriteIfaIPv4(struct ifaddrs *ifa, const char *addr) {
     if (!addr || !ifa || !ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) return;
@@ -1273,6 +1298,11 @@ static void miosBuildSpoofCache(void) {
         gcMGProductType = retainedCF(spoofStr(@"deviceIdentifier"));
         gcMGHWModel     = retainedCF(spoofStr(@"deviceHardwareModel"));
         gcMGDeviceName  = retainedCF(spoofStr(@"deviceDisplayName"));
+        NSString *ident = spoofStr(@"deviceIdentifier");
+        NSString *cls = [ident hasPrefix:@"iPad"] ? @"iPad"
+                      : [ident hasPrefix:@"iPod"] ? @"iPod touch"
+                      : [ident hasPrefix:@"iPhone"] ? @"iPhone" : nil;
+        gcMGDeviceClass = retainedCF(cls);
         // hw.cpufamily + hw.optional.arm.FEAT_* must track the spoofed SoC (IG reads both as part
         // of its device fingerprint). cpuFamily from config wins; else derive from the chip name.
         uint32_t fam = (uint32_t)[gSpoof[@"cpuFamily"] unsignedIntValue];
@@ -1993,16 +2023,19 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
         //   - sysctlbyname("hw.machine"/"hw.model")  — string-keyed sysctl
         //   - sysctl({CTL_HW, HW_MACHINE/HW_MODEL})  — array-keyed sysctl (IG uses this form too!)
         //   - uname()                                 — utsname.machine
-        // MobileGestalt (MGCopyAnswer) is intentionally NOT hooked: the import rebind + Substitute
-        // inline + narrow dlsym hooks were removed because the process-wide dlsym rebind crashed
-        // the app on arm64e/iOS 18. Device model/version still spoof via sysctl/uname + the ObjC
-        // UIDevice/NSProcessInfo hooks.
+        // MobileGestalt: ONLY the safe import rebind of MGCopyAnswer (what IG shows on screen and
+        // sends is the MG marketing-name/ProductType, not hw.machine). The crash-causing process-
+        // wide dlsym("MGCopyAnswer") rebind and the arm64e Substitute inline hook are NOT used.
         if (gDeviceSpoofActive) {
             rebind_symbols((struct rebinding[]){
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             }, 3);
+            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
+                rebind_symbols((struct rebinding[]){
+                    {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
+                }, 1);
         }
 
         // getifaddrs — Wi-Fi + cellular IP spoofing (Blaze fishhooks this too).
@@ -2047,6 +2080,14 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                 NSLog(@"[miOS-iso] SELFTEST UIDevice.systemVersion=%@ model=%@ (ObjC-hook path; enableSpoofSW=%d ios=%@)",
                       [UIDevice currentDevice].systemVersion, [UIDevice currentDevice].model,
                       (int)spoofBool(@"enableSpoofSoftwareVersion"), spoofStr(@"iosVersion"));
+                // MGCopyAnswer import rebind — this is the value IG shows in-app for the model.
+                CFTypeRef pt = mios_MGCopyAnswer(CFSTR("ProductType"));
+                CFTypeRef mn = mios_MGCopyAnswer(CFSTR("marketing-name"));
+                NSLog(@"[miOS-iso] SELFTEST MGCopyAnswer ProductType=%@ marketing-name=%@  want=%@ / %@",
+                      (__bridge id)pt, (__bridge id)mn,
+                      spoofStr(@"deviceIdentifier"), spoofStr(@"deviceDisplayName"));
+                if (pt) CFRelease(pt);
+                if (mn) CFRelease(mn);
             } @catch (__unused id e) {}
         });
 
