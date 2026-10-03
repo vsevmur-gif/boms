@@ -118,6 +118,13 @@ static char     *gcKernelVersion = NULL;  // uname.release-style + full kern.ver
 typedef struct { char *name; int value; } MiOSFeatOverride;
 static MiOSFeatOverride *gcFeatOverrides = NULL;
 static size_t gcFeatOverrideCount = 0;
+
+// Screen fingerprint. IG sends media_layout_screen_width/height/density (real native pixels),
+// which must match the spoofed model or the server sees model/resolution mismatch. We spoof ONLY
+// UIScreen.nativeBounds (pixels) and .nativeScale (density) — NEVER -bounds (points) or -scale,
+// which drive UI layout and would break/crash rendering if lied about. 0 = pass through.
+static CGFloat gcScreenW = 0, gcScreenH = 0;   // native pixels, portrait
+static CGFloat gcScreenNativeScale = 0;
 static CFDictionaryRef gcWifiInfo     = NULL;
 static CFStringRef gcMGProductType    = NULL;
 static CFStringRef gcMGHWModel        = NULL;
@@ -305,6 +312,17 @@ static CLLocation *spoofedLocationObject(void) {
 %hook UIScreen
 - (CGFloat)brightness {
     if (spoofBool(@"enableSpoofBrightness")) return (CGFloat)spoofDbl(@"brightnessLevel");
+    return %orig;
+}
+// nativeBounds is always portrait pixels and is what IG's media_layout_screen_* telemetry reads.
+// Only spoofed when we have a known resolution for the target model; layout APIs (-bounds/-scale)
+// are deliberately left real so the UI renders correctly.
+- (CGRect)nativeBounds {
+    if (gcScreenW > 0 && gcScreenH > 0) return CGRectMake(0, 0, gcScreenW, gcScreenH);
+    return %orig;
+}
+- (CGFloat)nativeScale {
+    if (gcScreenNativeScale > 0) return gcScreenNativeScale;
     return %orig;
 }
 %end
@@ -1198,6 +1216,51 @@ static void miosBuildFeatureOverrides(id cpuFeatures) {
     else   { free(arr); }
 }
 
+// Native screen resolution (portrait pixels) + nativeScale per iPhone identifier. Only models with
+// a confidently known resolution are listed; anything else (e.g. the iPhone 17 line) returns 0 and
+// passes through the real screen. Values are the documented device native resolutions.
+static void miosScreenForIdentifier(NSString *ident, CGFloat *w, CGFloat *h, CGFloat *scale) {
+    *w = *h = *scale = 0;
+    if (ident.length == 0) return;
+    static NSDictionary<NSString *, NSArray<NSNumber *> *> *map; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"iPhone9,1":  @[@750,  @1334, @2],   // iPhone 7
+            @"iPhone10,1": @[@750,  @1334, @2],   // iPhone 8
+            @"iPhone10,3": @[@1125, @2436, @3],   // iPhone X
+            @"iPhone11,8": @[@828,  @1792, @2],   // iPhone XR
+            @"iPhone11,2": @[@1125, @2436, @3],   // iPhone XS
+            @"iPhone11,6": @[@1242, @2688, @3],   // iPhone XS Max
+            @"iPhone12,1": @[@828,  @1792, @2],   // iPhone 11
+            @"iPhone12,3": @[@1125, @2436, @3],   // iPhone 11 Pro
+            @"iPhone12,5": @[@1242, @2688, @3],   // iPhone 11 Pro Max
+            @"iPhone13,1": @[@1080, @2340, @3],   // iPhone 12 mini
+            @"iPhone13,2": @[@1170, @2532, @3],   // iPhone 12
+            @"iPhone13,3": @[@1170, @2532, @3],   // iPhone 12 Pro
+            @"iPhone13,4": @[@1284, @2778, @3],   // iPhone 12 Pro Max
+            @"iPhone14,4": @[@1080, @2340, @3],   // iPhone 13 mini
+            @"iPhone14,5": @[@1170, @2532, @3],   // iPhone 13
+            @"iPhone14,2": @[@1170, @2532, @3],   // iPhone 13 Pro
+            @"iPhone14,3": @[@1284, @2778, @3],   // iPhone 13 Pro Max
+            @"iPhone14,7": @[@1170, @2532, @3],   // iPhone 14
+            @"iPhone14,8": @[@1284, @2778, @3],   // iPhone 14 Plus
+            @"iPhone15,2": @[@1179, @2556, @3],   // iPhone 14 Pro
+            @"iPhone15,3": @[@1290, @2796, @3],   // iPhone 14 Pro Max
+            @"iPhone15,4": @[@1179, @2556, @3],   // iPhone 15
+            @"iPhone15,5": @[@1290, @2796, @3],   // iPhone 15 Plus
+            @"iPhone16,1": @[@1179, @2556, @3],   // iPhone 15 Pro
+            @"iPhone16,2": @[@1290, @2796, @3],   // iPhone 15 Pro Max
+            @"iPhone17,3": @[@1179, @2556, @3],   // iPhone 16
+            @"iPhone17,4": @[@1290, @2796, @3],   // iPhone 16 Plus
+            @"iPhone17,1": @[@1206, @2622, @3],   // iPhone 16 Pro
+            @"iPhone17,2": @[@1320, @2868, @3],   // iPhone 16 Pro Max
+            @"iPhone18,1": @[@1170, @2532, @3],   // iPhone 16e
+        };
+    });
+    NSArray<NSNumber *> *v = map[ident];
+    if (v.count == 3) { *w = [v[0] floatValue]; *h = [v[1] floatValue]; *scale = [v[2] floatValue]; }
+}
+
 static void miosBuildSpoofCache(void) {
     gDeviceSpoofActive = spoofBool(@"enableSpoofDeviceModel") || spoofBool(@"enableSpoofSoftwareVersion") ||
                          spoofBool(@"enableSpoofMemory") || spoofBool(@"enableSpoofProcessor") ||
@@ -1214,6 +1277,14 @@ static void miosBuildSpoofCache(void) {
         if (!fam) fam = miosCPUFamilyForChip(spoofStr(@"chipName"));
         gcCPUFamily = fam;
         miosBuildFeatureOverrides(gSpoof[@"cpuFeatures"]);
+        // Screen native resolution must match the spoofed model (media_layout_screen_* telemetry).
+        // Config overrides win; else derive from the identifier. Only nativeBounds/nativeScale.
+        CGFloat sw = 0, sh = 0, ss = 0;
+        miosScreenForIdentifier(spoofStr(@"deviceIdentifier"), &sw, &sh, &ss);
+        if ([gSpoof[@"screenWidthPx"] doubleValue]  > 0) sw = (CGFloat)[gSpoof[@"screenWidthPx"] doubleValue];
+        if ([gSpoof[@"screenHeightPx"] doubleValue] > 0) sh = (CGFloat)[gSpoof[@"screenHeightPx"] doubleValue];
+        if ([gSpoof[@"screenNativeScale"] doubleValue] > 0) ss = (CGFloat)[gSpoof[@"screenNativeScale"] doubleValue];
+        gcScreenW = sw; gcScreenH = sh; gcScreenNativeScale = ss;
     }
     if (spoofBool(@"enableSpoofSoftwareVersion"))
         gcMGProductVersion = retainedCF(spoofStr(@"iosVersion"));
@@ -1965,6 +2036,12 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                       fam, gcCPUFamily,
                       gcCPUFamily ? (fam == gcCPUFamily ? @"WORKS" : @"NOT firing") : @"(passthrough)");
                 NSLog(@"[miOS-iso] SELFTEST FEAT overrides=%zu (crash-safe: requested && real)", gcFeatOverrideCount);
+                CGRect nb = [UIScreen mainScreen].nativeBounds;
+                NSLog(@"[miOS-iso] SELFTEST UIScreen.nativeBounds=%.0fx%.0f nativeScale=%.2f  want=%.0fx%.0f@%.2f (%@)",
+                      nb.size.width, nb.size.height, [UIScreen mainScreen].nativeScale,
+                      gcScreenW, gcScreenH, gcScreenNativeScale,
+                      (gcScreenW > 0 && nb.size.width == gcScreenW && nb.size.height == gcScreenH) ? @"WORKS"
+                        : (gcScreenW > 0 ? @"NOT firing" : @"(passthrough)"));
                 NSLog(@"[miOS-iso] SELFTEST UIDevice.systemVersion=%@ model=%@ (ObjC-hook path; enableSpoofSW=%d ios=%@)",
                       [UIDevice currentDevice].systemVersion, [UIDevice currentDevice].model,
                       (int)spoofBool(@"enableSpoofSoftwareVersion"), spoofStr(@"iosVersion"));
