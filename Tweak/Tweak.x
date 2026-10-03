@@ -107,7 +107,17 @@ static char     *gcMachine  = NULL;
 static char     *gcModel    = NULL;
 static uint64_t  gcMemsize  = 0;
 static int       gcCPU      = 0;
+static uint32_t  gcCPUFamily = 0;         // hw.cpufamily (0 = pass through real value)
 static char     *gcKernelVersion = NULL;  // uname.release-style + full kern.version
+
+// hw.optional.arm.FEAT_* overrides. IG reads ~18 of these as part of its device fingerprint;
+// they must stay consistent with the spoofed SoC. CRASH-SAFE INVARIANT: we never report a
+// feature as PRESENT unless the real CPU also has it (some libraries use these to pick
+// instructions; claiming a missing feature → SIGILL). So the effective value is
+// (requested && real): features can be HIDDEN to match an older target, never synthesized.
+typedef struct { char *name; int value; } MiOSFeatOverride;
+static MiOSFeatOverride *gcFeatOverrides = NULL;
+static size_t gcFeatOverrideCount = 0;
 static CFDictionaryRef gcWifiInfo     = NULL;
 static CFStringRef gcMGProductType    = NULL;
 static CFStringRef gcMGHWModel        = NULL;
@@ -939,12 +949,30 @@ static int copyIntOut(void *oldp, size_t *oldlenp, unsigned long long value) {
     else if (*oldlenp >= 4) { *(uint32_t *)oldp = (uint32_t)value; *oldlenp = 4; }
     return 0;
 }
+// Reply a 32-bit int, honoring the size-probe convention (oldp==NULL asks only for the length).
+// hw.cpufamily and hw.optional.* are all 32-bit ints.
+static int replyU32(void *oldp, size_t *oldlenp, uint32_t value) {
+    if (!oldp) { if (oldlenp) *oldlenp = sizeof(uint32_t); return 0; }
+    if (oldlenp && *oldlenp < sizeof(uint32_t)) { errno = ENOMEM; return -1; }
+    *(uint32_t *)oldp = value; if (oldlenp) *oldlenp = sizeof(uint32_t); return 0;
+}
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name && gDeviceSpoofActive) {
         if (gcMachine && strcmp(name, "hw.machine") == 0) return replyCString(oldp, oldlenp, gcMachine);
         if (gcModel   && strcmp(name, "hw.model")   == 0) return replyCString(oldp, oldlenp, gcModel);
         if (gcKernelVersion && (strcmp(name, "kern.version") == 0 || strcmp(name, "kern.osrelease") == 0))
             return replyCString(oldp, oldlenp, gcKernelVersion);
+        // hw.cpufamily — must match the spoofed SoC, or ProductType (e.g. iPhone15,2/A16) contradicts
+        // a real-CPU cpufamily. Pure fingerprint int, no instruction-selection impact → safe to force.
+        if (gcCPUFamily && strcmp(name, "hw.cpufamily") == 0)
+            return replyU32(oldp, oldlenp, gcCPUFamily);
+        // hw.optional.arm.FEAT_* — precomputed crash-safe overrides (requested && real). Keys we have
+        // no override for fall through to the real value below.
+        if (gcFeatOverrideCount && strncmp(name, "hw.optional.arm.FEAT_", 21) == 0) {
+            for (size_t i = 0; i < gcFeatOverrideCount; i++)
+                if (strcmp(name, gcFeatOverrides[i].name) == 0)
+                    return replyU32(oldp, oldlenp, (uint32_t)gcFeatOverrides[i].value);
+        }
         if ((gcMemsize || gcCPU) && oldp && oldlenp) {
             int r = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
             if (r != 0) return r;
@@ -1045,6 +1073,56 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 static char *dupCString(NSString *s) { return s.length ? strdup(s.UTF8String ?: "") : NULL; }
 static CFStringRef retainedCF(NSString *s) { return s.length ? (__bridge_retained CFStringRef)[s copy] : NULL; }
 
+// Resolve hw.cpufamily for a spoofed SoC. Values are the Apple CPUFAMILY_* constants from
+// <mach/machine.h>. Only the generations whose constant is known-good are mapped; newer chips
+// (A17 Pro / A18 / A19) return 0 = pass through the real value, since a wrong constant would be
+// a worse fingerprint than the honest one. Matched on the leading "A<n>" token of chipName
+// ("A16 Bionic" and "A16" both → A16).
+static uint32_t miosCPUFamilyForChip(NSString *chip) {
+    if (chip.length == 0) return 0;
+    NSString *tok = [[chip componentsSeparatedByString:@" "] firstObject];
+    if (tok.length == 0) return 0;
+    static NSDictionary<NSString *, NSNumber *> *map; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"A10": @(0x67ceee93u),  // Hurricane/Zephyr  (iPhone 7)
+            @"A11": @(0xe81e7ef6u),  // Monsoon/Mistral   (iPhone 8 / X)
+            @"A12": @(0x07d34b9fu),  // Vortex/Tempest    (iPhone XS/XR)
+            @"A13": @(0x462504d2u),  // Lightning/Thunder (iPhone 11)
+            @"A14": @(0x1b588bb3u),  // Firestorm/Icestorm(iPhone 12)
+            @"A15": @(0xda33d83du),  // Avalanche/Blizzard(iPhone 13 / 14 / 14 Plus)
+            @"A16": @(0x8765edeau),  // Everest/Sawtooth  (iPhone 14 Pro / 15 / 15 Plus / 16e)
+        };
+    });
+    NSNumber *v = map[tok];
+    return v ? (uint32_t)v.unsignedIntValue : 0;
+}
+
+// Build the crash-safe hw.optional.arm.FEAT_* override table from an optional config dictionary
+// (key "cpuFeatures": { "hw.optional.arm.FEAT_LSE": @1, ... }). Must run in the ctor BEFORE the
+// sysctl fishhook is installed, so the sysctlbyname() below reads the REAL CPU. Invariant:
+// effective = requested && real — a feature is only ever reported present if the real CPU has it.
+static void miosBuildFeatureOverrides(id cpuFeatures) {
+    if (![cpuFeatures isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *feats = cpuFeatures;
+    if (feats.count == 0) return;
+    MiOSFeatOverride *arr = calloc(feats.count, sizeof(MiOSFeatOverride));
+    if (!arr) return;
+    size_t i = 0;
+    for (NSString *k in feats) {
+        if (![k isKindOfClass:[NSString class]]) continue;
+        if (![k hasPrefix:@"hw.optional.arm.FEAT_"]) continue;
+        int requested = [feats[k] boolValue] ? 1 : 0;
+        int realv = 0; size_t rl = sizeof(realv);
+        if (sysctlbyname(k.UTF8String, &realv, &rl, NULL, 0) != 0) realv = 0;  // real sysctl (pre-hook)
+        arr[i].name  = strdup(k.UTF8String);
+        arr[i].value = (requested && realv) ? 1 : 0;
+        i++;
+    }
+    if (i) { gcFeatOverrides = arr; gcFeatOverrideCount = i; }
+    else   { free(arr); }
+}
+
 static void miosBuildSpoofCache(void) {
     gDeviceSpoofActive = spoofBool(@"enableSpoofDeviceModel") || spoofBool(@"enableSpoofSoftwareVersion") ||
                          spoofBool(@"enableSpoofMemory") || spoofBool(@"enableSpoofProcessor") ||
@@ -1055,6 +1133,12 @@ static void miosBuildSpoofCache(void) {
         gcMGProductType = retainedCF(spoofStr(@"deviceIdentifier"));
         gcMGHWModel     = retainedCF(spoofStr(@"deviceHardwareModel"));
         gcMGDeviceName  = retainedCF(spoofStr(@"deviceDisplayName"));
+        // hw.cpufamily + hw.optional.arm.FEAT_* must track the spoofed SoC (IG reads both as part
+        // of its device fingerprint). cpuFamily from config wins; else derive from the chip name.
+        uint32_t fam = (uint32_t)[gSpoof[@"cpuFamily"] unsignedIntValue];
+        if (!fam) fam = miosCPUFamilyForChip(spoofStr(@"chipName"));
+        gcCPUFamily = fam;
+        miosBuildFeatureOverrides(gSpoof[@"cpuFeatures"]);
     }
     if (spoofBool(@"enableSpoofSoftwareVersion"))
         gcMGProductVersion = retainedCF(spoofStr(@"iosVersion"));
@@ -1778,6 +1862,13 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                 sysctl(mib, 2, amch, &aml, NULL, 0);
                 NSLog(@"[miOS-iso] SELFTEST sysctl[CTL_HW,HW_MACHINE]=%s  (array-form C-hook %@)",
                       amch, (wantModel.length && strcmp(amch, wantModel.UTF8String) == 0) ? @"WORKS" : @"NOT firing");
+                // hw.cpufamily — must equal gcCPUFamily when the spoofed chip is in the known table.
+                uint32_t fam = 0; size_t fl = sizeof(fam);
+                sysctlbyname("hw.cpufamily", &fam, &fl, NULL, 0);
+                NSLog(@"[miOS-iso] SELFTEST hw.cpufamily=0x%08x  want=0x%08x  (cpufamily-hook %@)",
+                      fam, gcCPUFamily,
+                      gcCPUFamily ? (fam == gcCPUFamily ? @"WORKS" : @"NOT firing") : @"(passthrough)");
+                NSLog(@"[miOS-iso] SELFTEST FEAT overrides=%zu (crash-safe: requested && real)", gcFeatOverrideCount);
                 NSLog(@"[miOS-iso] SELFTEST UIDevice.systemVersion=%@ model=%@ (ObjC-hook path; enableSpoofSW=%d ios=%@)",
                       [UIDevice currentDevice].systemVersion, [UIDevice currentDevice].model,
                       (int)spoofBool(@"enableSpoofSoftwareVersion"), spoofStr(@"iosVersion"));
