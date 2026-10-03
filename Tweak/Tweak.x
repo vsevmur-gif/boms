@@ -2332,16 +2332,26 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
 // "%hook NSURLSession"); the body rewrite is wired into those existing methods to avoid a
 // duplicate-hook compile error.
 
-// MARK: - Constructor
+// MARK: - Earliest boot (+load)
+//
+// +load runs BEFORE any __attribute__((constructor)) — including Instagram's own constructors
+// and +load methods in its classes, because our dylib is a dependency (LC_LOAD_DYLIB) of the
+// main executable, so dyld loads and initializes us first. This is the absolute earliest point
+// we can run code in userspace without DYLD_INTERPOSE.
+//
+// We do: Instagram detection → container resolution → spoof cache → fishhook (C functions).
+// By the time IG's own +load fires, sysctl/uname/MGCopyAnswer are already hooked.
 
-%ctor {
+static BOOL gEarlyBootDone = NO;
+static MiOSContainer *gEarlyBootActiveContainer = nil;
+
+@interface MiOSEarlyBoot : NSObject @end
+@implementation MiOSEarlyBoot
++ (void)load {
     @autoreleasepool {
         gT0 = mach_absolute_time();
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *exeName = [[[NSBundle mainBundle] executablePath] lastPathComponent] ?: @"";
-
-        // Loose Instagram detection: signer-renamed bundle IDs still match. We only need to
-        // avoid firing inside SpringBoard or an unrelated app that happens to load this dylib.
         NSString *low = bundleID.lowercaseString;
         BOOL isInstagram = ([low containsString:@"burbn"] ||
                             [low containsString:@"instagram"] ||
@@ -2352,68 +2362,12 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
         MiOSSetRealHome(gRealHome);
         setenv("MIOS_REAL_HOME", gRealHome.UTF8String, 1);
 
-        // Install the diagnostic logger as early as possible so it captures a silent exit
-        // during registration. Writes to <home>/Documents/miOS-diag.log.
-        gMainPThread = pthread_self();   // the ctor runs on the main thread during dyld load
-        miosInstallDiagnostics(gRealHome);
-        miosLog(@"ctor engaged: bundleID=%@ exe=%@ home=%@", bundleID, exeName, gRealHome);
-        // Confirm the main-thread handle from the main queue too (belt and suspenders).
-        dispatch_async(dispatch_get_main_queue(), ^{ gMainPThread = pthread_self(); });
-        miosStartWatchdog();   // detect main-thread freeze vs. network wait during the spinner
-
-        // Diagnostic: a 'did I load?' marker overwritten each launch. If none of these files
-        // exist after you open Instagram, dyld didn't load the dylib (signing stripped it,
-        // LC_LOAD_DYLIB wasn't injected, or ldid signature was invalid).
-        @try {
-            NSString *diag = [NSString stringWithFormat:
-                @"miOS loaded at %@\nbundleID=%@\nexecutable=%@\nhome=%@\ntmp=%@\n",
-                [NSDate date], bundleID, exeName, gRealHome, NSTemporaryDirectory()];
-            NSArray<NSString *> *paths = @[
-                [[gRealHome stringByAppendingPathComponent:@"Documents"]
-                    stringByAppendingPathComponent:@"mios-loaded.txt"],
-                [NSTemporaryDirectory() stringByAppendingPathComponent:@"mios-loaded.txt"],
-                [[gRealHome stringByAppendingPathComponent:@"Library/Caches"]
-                    stringByAppendingPathComponent:@"mios-loaded.txt"],
-            ];
-            for (NSString *path in paths) {
-                [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
-                                          withIntermediateDirectories:YES attributes:nil error:nil];
-                [diag writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            }
-        } @catch (__unused id e) {}
-
-        [MiOSUI install];   // floating button is always available
-
-        // Sideload fixes are ALWAYS on (independent of spoof mode): without them a resigned
-        // Instagram crashes at login regardless of containers/spoofing. Mirrors opa334.
-        %init(SideloadFixes);
-        miosLog(@"SideloadFixes installed (keychain access group + app-group container)");
-
-        // Default is the permanent base container: if nothing is selected (e.g. first launch),
-        // activate Default rather than passing through. Pass-through would route accounts to the
-        // REAL, un-namespaced keychain (which survives reinstall and leaks across containers) —
-        // the root cause of "old accounts still show in Default after clearing cache".
         MiOSContainer *active = [MiOSContainer activeOrDefaultContainer];
-        if (!active) {
-            miosLog(@"no active container and Default unavailable — passing through");
-            return;
-        }
+        if (!active) return;
 
         gContainerUUID = [active.identifier copy];
-        // CONTAINER ISOLATION is independent of the Spoof toggle: EVERY active container
-        // (including Default, which has enableSpoof = NO) gets its own fully isolated sandbox —
-        // filesystem, NSUserDefaults (the session store), and keychain. Device-fingerprint
-        // spoofing is the only thing gated by enableSpoof.
         gSpoof = active.enableSpoof ? [[active spoofPrefs] copy] : @{};
-        miosLog(@"active container=%@ enableSpoof=%d — installing isolation",
-                gContainerUUID, (int)active.enableSpoof);
 
-        // DEVICE SPOOF FIRST — build the spoof cache, capture the real device, and install the
-        // low-level device hooks (sysctl/uname + the MGCopyAnswer import rebind) BEFORE any other
-        // isolation work, so the fingerprint is spoofed as early as the ctor allows. IGUserAgent
-        // reads hw.machine via sysctlbyname, so getting that fishhook in first shrinks the window.
-        // (Our ctor already runs before the app's main(); the timing-independent guarantee is the
-        // User-Agent / body rewrite on outgoing requests below.)
         miosBuildSpoofCache();
         if (gDeviceSpoofActive) {
             char m[128] = {0}; size_t ml = sizeof(m);
@@ -2431,8 +2385,8 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
                     else if (fn) CFRelease(fn);
                 }
             }
-            NSLog(@"[miOS-iso] captured REAL device: machine=%@ ios=%@ friendly=%@",
-                  gRealMachineNS, gRealIOSNS, gRealFriendlyNS);
+            NSLog(@"[miOS-time] +load: captured REAL device @%.0fms machine=%@ ios=%@",
+                  miosMsSinceStart(), gRealMachineNS, gRealIOSNS);
             rebind_symbols((struct rebinding[]){
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
@@ -2442,23 +2396,117 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
                 rebind_symbols((struct rebinding[]){
                     {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
                 }, 1);
-            NSLog(@"[miOS-time] device hooks INSTALLED @%.0fms (early, before FS/keychain)", miosMsSinceStart());
-            // FBSharedFramework UA builders — the model in IG's UA comes from here, not the ObjC
-            // getter. Rewrite the device/model/iOS in the returned string, timing-independent.
             rebind_symbols((struct rebinding[]){
                 {"METAGenerateInstagramStyleUserAgentInfoString", (void *)hook_METAGenUA,    (void **)&orig_METAGenUA},
                 {"METAGetWKWebViewUserAgent",                     (void *)hook_METAWKUA,     (void **)&orig_METAWKUA},
                 {"METAWKWebViewDefaultUserAgentForCurrentApp",    (void *)hook_METAWKUADef,  (void **)&orig_METAWKUADef},
             }, 3);
+            NSLog(@"[miOS-time] +load: C hooks INSTALLED @%.0fms (before ANY IG +load/ctor)",
+                  miosMsSinceStart());
+        }
+        gEarlyBootActiveContainer = active;
+        gEarlyBootDone = YES;
+    }
+}
+@end
+
+// MARK: - Constructor
+
+%ctor {
+    @autoreleasepool {
+        if (!gEarlyBootDone) {
+            // +load didn't fire (shouldn't happen, but defensive fallback)
+            gT0 = mach_absolute_time();
+            NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+            NSString *exeName = [[[NSBundle mainBundle] executablePath] lastPathComponent] ?: @"";
+            NSString *low = bundleID.lowercaseString;
+            BOOL isInstagram = ([low containsString:@"burbn"] ||
+                                [low containsString:@"instagram"] ||
+                                [exeName isEqualToString:@"Instagram"]);
+            if (!isInstagram) return;
+            gRealHome = [NSHomeDirectory() copy];
+            MiOSSetRealHome(gRealHome);
+            setenv("MIOS_REAL_HOME", gRealHome.UTF8String, 1);
+        } else if (!gRealHome) {
+            return;
         }
 
-        // ObjC identity hooks IMMEDIATELY after C-level fishhooks — before FS/keychain/App-Group
-        // so Instagram cannot cache real IDFV/model/screen from +load or early initializers.
+        gMainPThread = pthread_self();
+        miosInstallDiagnostics(gRealHome);
+        miosLog(@"ctor engaged: earlyBoot=%d home=%@", (int)gEarlyBootDone, gRealHome);
+        dispatch_async(dispatch_get_main_queue(), ^{ gMainPThread = pthread_self(); });
+        miosStartWatchdog();
+
+        @try {
+            NSString *diag = [NSString stringWithFormat:
+                @"miOS loaded at %@\nhome=%@\ntmp=%@\nearlyBoot=%d\n",
+                [NSDate date], gRealHome, NSTemporaryDirectory(), (int)gEarlyBootDone];
+            NSString *path = [[gRealHome stringByAppendingPathComponent:@"Documents"]
+                                stringByAppendingPathComponent:@"mios-loaded.txt"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            [diag writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } @catch (__unused id e) {}
+
+        [MiOSUI install];
+
+        %init(SideloadFixes);
+        miosLog(@"SideloadFixes installed (keychain access group + app-group container)");
+
+        MiOSContainer *active = gEarlyBootActiveContainer;
+        if (!active) {
+            active = [MiOSContainer activeOrDefaultContainer];
+            if (!active) {
+                miosLog(@"no active container and Default unavailable — passing through");
+                return;
+            }
+            gContainerUUID = [active.identifier copy];
+            gSpoof = active.enableSpoof ? [[active spoofPrefs] copy] : @{};
+        }
+        miosLog(@"active container=%@ enableSpoof=%d earlyBoot=%d",
+                gContainerUUID, (int)active.enableSpoof, (int)gEarlyBootDone);
+
+        if (!gEarlyBootDone) {
+            miosBuildSpoofCache();
+            if (gDeviceSpoofActive) {
+                char m[128] = {0}; size_t ml = sizeof(m);
+                if (sysctlbyname("hw.machine", m, &ml, NULL, 0) == 0 && m[0])
+                    gRealMachineNS = [NSString stringWithUTF8String:m];
+                char v[128] = {0}; size_t vl = sizeof(v);
+                if (sysctlbyname("kern.osproductversion", v, &vl, NULL, 0) == 0 && v[0])
+                    gRealIOSNS = [NSString stringWithUTF8String:v];
+                void *mgH = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+                if (mgH) {
+                    CFTypeRef (*mg)(CFStringRef) = (CFTypeRef (*)(CFStringRef))dlsym(mgH, "MGCopyAnswer");
+                    if (mg) {
+                        CFTypeRef fn = mg(CFSTR("marketing-name"));
+                        if (fn && CFGetTypeID(fn) == CFStringGetTypeID()) gRealFriendlyNS = (__bridge_transfer NSString *)fn;
+                        else if (fn) CFRelease(fn);
+                    }
+                }
+                rebind_symbols((struct rebinding[]){
+                    {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+                    {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
+                    {"uname",        (void *)hook_uname,        (void **)&orig_uname},
+                }, 3);
+                if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
+                    rebind_symbols((struct rebinding[]){
+                        {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
+                    }, 1);
+                rebind_symbols((struct rebinding[]){
+                    {"METAGenerateInstagramStyleUserAgentInfoString", (void *)hook_METAGenUA,    (void **)&orig_METAGenUA},
+                    {"METAGetWKWebViewUserAgent",                     (void *)hook_METAWKUA,     (void **)&orig_METAWKUA},
+                    {"METAWKWebViewDefaultUserAgentForCurrentApp",    (void *)hook_METAWKUADef,  (void **)&orig_METAWKUADef},
+                }, 3);
+            }
+            NSLog(@"[miOS-time] ctor fallback: C hooks INSTALLED @%.0fms", miosMsSinceStart());
+        }
+
         dlopen("/System/Library/Frameworks/DeviceCheck.framework/DeviceCheck", RTLD_LAZY);
         %init(EarlyIdentity);
-        NSLog(@"[miOS-time] EarlyIdentity ObjC hooks INSTALLED @%.0fms (IDFV/IDFA/model/screen/DeviceCheck)", miosMsSinceStart());
+        NSLog(@"[miOS-time] EarlyIdentity ObjC hooks @%.0fms", miosMsSinceStart());
 
-        // 1. Filesystem isolation first.
+        // 1. Filesystem isolation.
         miosInstallContainerFS(active);
 
         // 1b. NSUserDefaults isolation (the session store cfprefsd keeps outside our FS redirect).
