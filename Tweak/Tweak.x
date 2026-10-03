@@ -2,6 +2,7 @@
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <SafariServices/SafariServices.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -656,7 +657,12 @@ static NSDictionary *kcModify(CFDictionaryRef dict) {
         // Inject a per-container service so each container gets its own copy; applied identically on
         // add/copy/update/delete, so the item stays findable within the container and isolated
         // across containers. The old shared item is simply never matched again.
-        m[(__bridge id)kSecAttrService] = [gKcPrefix stringByAppendingString:@"__noservice__"];
+        NSString *ns = [gKcPrefix stringByAppendingString:@"__noservice__"];
+        m[(__bridge id)kSecAttrService] = ns;
+        static int lg = 0;
+        if (lg < 40) { lg++;
+            NSLog(@"[miOS-kc] NAMESPACED serviceless item grp=%@ -> service=%@ (now container-private)",
+                  m[(__bridge id)kSecAttrAccessGroup], ns); }
     }
     return m;
 }
@@ -1241,6 +1247,8 @@ static NSString *miosWebSpoofJS(void) {
 }
 %hook WKWebView
 - (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    NSLog(@"[miOS-web] WKWebView init FIRED class=%@ spoofActive=%d cfg=%d",
+          NSStringFromClass([self class]), (int)gDeviceSpoofActive, configuration != nil);
     @try {
         NSString *js = miosWebSpoofJS();
         if (js && configuration) {
@@ -1249,9 +1257,23 @@ static NSString *miosWebSpoofJS(void) {
                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                     forMainFrameOnly:NO]];
             configuration.userContentController = ucc;
-            NSLog(@"[miOS-web] injected device-spoof user script into WKWebView");
+            NSLog(@"[miOS-web] injected device-spoof user script (len=%lu)", (unsigned long)js.length);
+        } else {
+            NSLog(@"[miOS-web] NOT injected (js=%d cfg=%d)", js != nil, configuration != nil);
         }
     } @catch (__unused id e) {}
+    return %orig;
+}
+- (void)loadRequest:(NSURLRequest *)request {
+    NSLog(@"[miOS-web] WKWebView loadRequest %@", request.URL.absoluteString);
+    %orig;
+}
+%end
+// If the Accounts Center opens in a system Safari view instead of an in-process WKWebView, our
+// WKUserScript injection is impossible — log that path so we can tell which one IG uses.
+%hook SFSafariViewController
+- (instancetype)initWithURL:(NSURL *)url {
+    NSLog(@"[miOS-web] SFSafariViewController(URL) %@ — CANNOT inject (separate process)", url.absoluteString);
     return %orig;
 }
 %end
