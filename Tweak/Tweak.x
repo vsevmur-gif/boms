@@ -26,6 +26,7 @@
 #import <time.h>
 #import <pthread.h>
 #import <mach-o/dyld.h>
+#import <mach/mach_time.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -128,6 +129,15 @@ static size_t gcFeatOverrideCount = 0;
 // which drive UI layout and would break/crash rendering if lied about. 0 = pass through.
 static CGFloat gcScreenW = 0, gcScreenH = 0;   // native pixels, portrait
 static CGFloat gcScreenNativeScale = 0;
+
+// Startup timing — to test whether IG reads/caches the device model before our hooks install.
+static uint64_t gT0 = 0;   // set at the very start of the ctor
+static double miosMsSinceStart(void) {
+    if (!gT0) return -1;
+    static double scale = 0;
+    if (scale == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); scale = (double)tb.numer / tb.denom / 1e6; }
+    return (double)(mach_absolute_time() - gT0) * scale;
+}
 static CFDictionaryRef gcWifiInfo     = NULL;
 static CFStringRef gcMGProductType    = NULL;
 static CFStringRef gcMGHWModel        = NULL;
@@ -1070,6 +1080,12 @@ static int replyU32(void *oldp, size_t *oldlenp, uint32_t value) {
     *(uint32_t *)oldp = value; if (oldlenp) *oldlenp = sizeof(uint32_t); return 0;
 }
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && strcmp(name, "hw.machine") == 0) {
+        static int tlog = 0;
+        if (tlog < 16) { tlog++;
+            NSLog(@"[miOS-time] sysctl hw.machine @%.0fms spoofActive=%d (hook up)",
+                  miosMsSinceStart(), (int)gDeviceSpoofActive); }
+    }
     if (name && gDeviceSpoofActive) {
         if (gcMachine && strcmp(name, "hw.machine") == 0) return replyCString(oldp, oldlenp, gcMachine);
         if (gcModel   && strcmp(name, "hw.model")   == 0) return replyCString(oldp, oldlenp, gcModel);
@@ -1133,6 +1149,15 @@ __attribute__((unused)) static CFDictionaryRef hook_CNCopyCurrentNetworkInfo(CFS
 // the Substitute inline hook are intentionally NOT reinstated.
 static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef) = NULL;
 static CFTypeRef mios_MGCopyAnswer(CFStringRef key) {
+    if (key) {
+        static int tlog = 0;
+        if (tlog < 16 && (CFEqual(key, CFSTR("ProductType")) || CFEqual(key, CFSTR("marketing-name")) ||
+                          CFEqual(key, CFSTR("ProductVersion")))) {
+            tlog++;
+            NSLog(@"[miOS-time] MGCopyAnswer(%@) @%.0fms spoofActive=%d (hook up)",
+                  (__bridge NSString *)key, miosMsSinceStart(), (int)gDeviceSpoofActive);
+        }
+    }
     if (gDeviceSpoofActive && key) {
         if (gcMGProductType && CFEqual(key, CFSTR("ProductType")))      return CFRetain(gcMGProductType);
         if (gcMGProductVersion && CFEqual(key, CFSTR("ProductVersion"))) return CFRetain(gcMGProductVersion);
@@ -1979,6 +2004,7 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
 
 %ctor {
     @autoreleasepool {
+        gT0 = mach_absolute_time();
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *exeName = [[[NSBundle mainBundle] executablePath] lastPathComponent] ?: @"";
 
@@ -2128,6 +2154,7 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
                 rebind_symbols((struct rebinding[]){
                     {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
                 }, 1);
+            NSLog(@"[miOS-time] device hooks (sysctl/uname/MGCopyAnswer) INSTALLED @%.0fms", miosMsSinceStart());
         }
 
         // getifaddrs — Wi-Fi + cellular IP spoofing (Blaze fishhooks this too).
