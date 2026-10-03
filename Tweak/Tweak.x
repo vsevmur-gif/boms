@@ -63,6 +63,13 @@ static void miosStartWatchdog(void);
 + (BOOL)isSupported;
 - (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion;
 @end
+@interface DCAppAttestService : NSObject
++ (instancetype)sharedService;
+@property (readonly, getter=isSupported) BOOL supported;
+- (void)generateKeyWithCompletionHandler:(void (^)(NSString *keyId, NSError *error))completion;
+- (void)attestKey:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *attestation, NSError *error))completion;
+- (void)generateAssertion:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *assertion, NSError *error))completion;
+@end
 
 // Keychain-wrapper classes that Instagram / the Facebook SDK use. On a sideloaded (resigned)
 // build they request a hard-coded keychain access group the app isn't entitled to, so SecItem
@@ -479,16 +486,57 @@ static CLLocation *spoofedLocationObject(void) {
 // anyway, and failing it loudly is worse than not using it.)
 %hook DCDevice
 + (BOOL)isSupported {
-    if (spoofBool(@"enableSpoofDeviceCheck")) return NO;
+    BOOL on = spoofBool(@"enableSpoofDeviceCheck");
+    NSLog(@"[miOS-att] DCDevice.isSupported called (spoof=%d -> %@)", (int)on, on ? @"NO" : @"orig");
+    if (on) return NO;
     return %orig;
 }
 - (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion {
+    NSLog(@"[miOS-att] DCDevice.generateToken called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
     if (spoofBool(@"enableSpoofDeviceCheck")) {
         if (completion) {
             NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1
                                            userInfo:@{NSLocalizedDescriptionKey: @"DeviceCheck unavailable"}];
             completion(nil, err);
         }
+        return;
+    }
+    %orig;
+}
+%end
+// App Attest (DCAppAttestService) — the OTHER Secure-Enclave attestation. Like DeviceCheck, a valid
+// attestation cryptographically proves THIS physical device, so Apple (and thus Meta server-side)
+// can correlate every container to one phone. Gated by the same enableSpoofDeviceCheck toggle: make
+// it unavailable and fail key/attestation generation so no hardware attestation is produced.
+%hook DCAppAttestService
+- (BOOL)isSupported {
+    BOOL on = spoofBool(@"enableSpoofDeviceCheck");
+    NSLog(@"[miOS-att] AppAttest.isSupported called (spoof=%d -> %@)", (int)on, on ? @"NO" : @"orig");
+    if (on) return NO;
+    return %orig;
+}
+- (void)generateKeyWithCompletionHandler:(void (^)(NSString *keyId, NSError *error))completion {
+    NSLog(@"[miOS-att] AppAttest.generateKey called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:2
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
+        return;
+    }
+    %orig;
+}
+- (void)attestKey:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *attestation, NSError *error))completion {
+    NSLog(@"[miOS-att] AppAttest.attestKey called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:3
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
+        return;
+    }
+    %orig;
+}
+- (void)generateAssertion:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *assertion, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:4
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
         return;
     }
     %orig;
