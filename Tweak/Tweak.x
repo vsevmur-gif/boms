@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -18,6 +19,7 @@
 #import <execinfo.h>
 #import <signal.h>
 #import <stdlib.h>
+#import <math.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <time.h>
@@ -643,8 +645,19 @@ static NSDictionary *kcModify(CFDictionaryRef dict) {
     NSMutableDictionary *m = dict ? [(__bridge NSDictionary *)dict mutableCopy]
                                   : [NSMutableDictionary dictionary];
     id svc = m[(__bridge id)kSecAttrService];
-    if ([svc isKindOfClass:[NSString class]] && ![(NSString *)svc hasPrefix:gKcPrefix])
-        m[(__bridge id)kSecAttrService] = [gKcPrefix stringByAppendingString:(NSString *)svc];
+    if ([svc isKindOfClass:[NSString class]] && [(NSString *)svc length] > 0) {
+        if (![(NSString *)svc hasPrefix:gKcPrefix])
+            m[(__bridge id)kSecAttrService] = [gKcPrefix stringByAppendingString:(NSString *)svc];
+    } else {
+        // No service to namespace by — e.g. the shared Family Device ID, a genp item keyed ONLY by
+        // access group group.com.facebook.family (service/account/server all null). Without this it
+        // is the SAME item in every container, so every container reports the same device id (and
+        // the Bloks GetFamilyDeviceId/FetchDeviceID the Accounts Center WebView reads returns it).
+        // Inject a per-container service so each container gets its own copy; applied identically on
+        // add/copy/update/delete, so the item stays findable within the container and isolated
+        // across containers. The old shared item is simply never matched again.
+        m[(__bridge id)kSecAttrService] = [gKcPrefix stringByAppendingString:@"__noservice__"];
+    }
     return m;
 }
 static OSStatus new_SecItemAdd(CFDictionaryRef a, CFTypeRef *r) {
@@ -1185,6 +1198,63 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 }
 %end
 // end ProxyHooks
+
+// MARK: - WebView (Accounts Center / In-App-Browser) device spoof
+//
+// Instagram's Accounts Center ("Where you're logged in") is a Meta web page (accountscenter.meta.com)
+// loaded in a WKWebView. WebKit renders it in a SEPARATE process (com.apple.WebKit.WebContent) that
+// our native sysctl/MGCopyAnswer/UIScreen hooks never reach, so the page reads the REAL device via
+// navigator.userAgent, navigator.hardwareConcurrency, screen.* and devicePixelRatio (IG also pulls
+// navigator.userAgent back over a JS bridge). We inject a documentStart WKUserScript — evaluated in
+// the content process before the page's own scripts — that overrides exactly those signals to match
+// the spoofed device. Only properties that real iOS Safari actually exposes are touched (no
+// navigator.deviceMemory — Safari lacks it, so adding it would itself be a tell), and window.inner*
+// is left alone so page layout is not disturbed.
+static NSString *miosWebSpoofJS(void) {
+    if (!gDeviceSpoofActive) return nil;
+    NSMutableString *js = [NSMutableString stringWithString:@"(function(){"];
+    NSString *ios = spoofBool(@"enableSpoofSoftwareVersion") ? spoofStr(@"iosVersion") : nil;
+    if (ios.length) {
+        NSString *u = [ios stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+        [js appendFormat:@"try{var p='iPhone OS %@';var ua=navigator.userAgent"
+                         @".replace(/iPhone OS \\d+_\\d+(_\\d+)?/,p)"
+                         @".replace(/Version\\/\\d+\\.\\d+(\\.\\d+)?/,'Version/%@');"
+                         @"Object.defineProperty(navigator,'userAgent',{get:function(){return ua;}});}catch(e){}",
+                         u, ios];
+    }
+    NSInteger cores = spoofInt(@"cpuCores");
+    if (cores > 0)
+        [js appendFormat:@"try{Object.defineProperty(navigator,'hardwareConcurrency',{get:function(){return %ld;}});}catch(e){}", (long)cores];
+    if (gcScreenNativeScale > 0)
+        [js appendFormat:@"try{Object.defineProperty(window,'devicePixelRatio',{get:function(){return %g;}});}catch(e){}", (double)gcScreenNativeScale];
+    if (gcScreenW > 0 && gcScreenH > 0 && gcScreenNativeScale > 0) {
+        long cssW = lround(gcScreenW / gcScreenNativeScale);
+        long cssH = lround(gcScreenH / gcScreenNativeScale);
+        [js appendFormat:@"try{Object.defineProperty(screen,'width',{get:function(){return %ld;}});"
+                         @"Object.defineProperty(screen,'height',{get:function(){return %ld;}});"
+                         @"Object.defineProperty(screen,'availWidth',{get:function(){return %ld;}});"
+                         @"Object.defineProperty(screen,'availHeight',{get:function(){return %ld;}});}catch(e){}",
+                         cssW, cssH, cssW, cssH];
+    }
+    [js appendString:@"})();"];
+    return js.length > 14 ? js : nil;   // >"(function(){})();" means at least one override added
+}
+%hook WKWebView
+- (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    @try {
+        NSString *js = miosWebSpoofJS();
+        if (js && configuration) {
+            WKUserContentController *ucc = configuration.userContentController ?: [WKUserContentController new];
+            [ucc addUserScript:[[WKUserScript alloc] initWithSource:js
+                                    injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                    forMainFrameOnly:NO]];
+            configuration.userContentController = ucc;
+            NSLog(@"[miOS-web] injected device-spoof user script into WKWebView");
+        }
+    } @catch (__unused id e) {}
+    return %orig;
+}
+%end
 
 // MARK: - Build the allocation-free cache
 

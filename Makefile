@@ -22,7 +22,7 @@ miOS_FILES = \
 miOS_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 miOS_FRAMEWORKS = Foundation CoreFoundation UIKit CoreLocation MapKit \
                   Security CoreTelephony SystemConfiguration CoreMotion \
-                  QuartzCore MessageUI
+                  QuartzCore MessageUI WebKit
 miOS_PRIVATE_FRAMEWORKS =
 
 # --- Jailed (sideload / no-JB) build via theos-jailed -------------------------------------
