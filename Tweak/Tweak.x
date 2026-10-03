@@ -1205,10 +1205,12 @@ static NSString *miosRewriteUA(NSString *ua);   // defined with the request hook
 - (void)setHTTPAdditionalHeaders:(NSDictionary *)headers {
     if (gDeviceSpoofActive && [headers isKindOfClass:[NSDictionary class]]) {
         NSMutableDictionary *m = [headers mutableCopy];
-        for (id k in headers)
+        for (id k in headers) {
             if ([k isKindOfClass:[NSString class]] && [k caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
                 m[k] = miosRewriteUA(headers[k]);
-        %orig(m); return;
+        }
+        %orig(m);
+        return;
     }
     %orig;
 }
@@ -2033,24 +2035,30 @@ static NSString *miosRewriteUA(NSString *ua) {
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
     if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
         [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
-        %orig(miosRewriteUA(value), field); return;
+        NSString *nv = miosRewriteUA(value);
+        %orig(nv, field);
+        return;
     }
     %orig;
 }
 - (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
     if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
         [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
-        %orig(miosRewriteUA(value), field); return;
+        NSString *nv = miosRewriteUA(value);
+        %orig(nv, field);
+        return;
     }
     %orig;
 }
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headers {
     if (gDeviceSpoofActive && [headers isKindOfClass:[NSDictionary class]]) {
         NSMutableDictionary *m = [headers mutableCopy];
-        for (NSString *k in headers)
+        for (NSString *k in headers) {
             if ([k isKindOfClass:[NSString class]] && [k caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
                 m[k] = miosRewriteUA(headers[k]);
-        %orig(m); return;
+        }
+        %orig(m);
+        return;
     }
     %orig;
 }
