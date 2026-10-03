@@ -2398,6 +2398,29 @@ static NSString *miosRewriteUA(NSString *ua) {
         // each self-gates with its own spoofBool(...) check).
         %init;
 
+        // Diagnostic: did the IGUserAgent %hook have a class to attach to, and what are the real
+        // UA class names + do the FBSharedFramework UA C functions exist? Tells us why [miOS-ua]
+        // may be silent (wrong class name / class not loaded / IG uses the C builders instead).
+        @try {
+            NSLog(@"[miOS-ua] _TtC11IGUserAgent11IGUserAgent class = %p",
+                  (void *)objc_getClass("_TtC11IGUserAgent11IGUserAgent"));
+            unsigned int ncls = 0; Class *all = objc_copyClassList(&ncls);
+            int logged = 0;
+            for (unsigned int i = 0; i < ncls && logged < 40; i++) {
+                const char *cn = class_getName(all[i]);
+                if (cn && (strstr(cn, "UserAgent") || strstr(cn, "userAgent"))) {
+                    NSLog(@"[miOS-ua] UA class present: %s", cn); logged++;
+                }
+            }
+            if (all) free(all);
+            const char *fns[] = { "METAGenerateInstagramStyleUserAgentInfoString",
+                                  "METAGetWKWebViewUserAgent",
+                                  "METAWKWebViewDefaultUserAgentForCurrentApp",
+                                  "METAUserAgentInfoDefaultValue" };
+            for (int i = 0; i < 4; i++)
+                NSLog(@"[miOS-ua] C fn %s = %p", fns[i], dlsym(RTLD_DEFAULT, fns[i]));
+        } @catch (__unused id e) {}
+
         // DeviceCheck and App Attest are not hooked at all (removed to match Blaze).
 
         // getifaddrs — Wi-Fi + cellular IP spoofing (Blaze fishhooks this too).

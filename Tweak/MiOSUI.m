@@ -669,6 +669,8 @@ static void MiOSRandomizeCarrierInCountry(MiOSContainer *m) {
                                    shuffle:^{ ws.container.advertisingID = [NSUUID UUID].UUIDString; [ws reload]; }]];
     }
     [ids addSeparator];
+    [ids addCellView:[self toggle:@"Device Checker" sub:@"DCDevice → unsupported (no hardware token)" icon:@"checkmark.shield" on:m.enableSpoofDeviceCheck change:^(BOOL on){ ws.container.enableSpoofDeviceCheck = on; }]];
+    [ids addSeparator];
     [ids addCellView:[self toggle:@"Hide iCloud token" sub:@"ubiquityIdentityToken → nil" icon:@"icloud.slash" on:m.enableSpoofCloudToken change:^(BOOL on){ ws.container.enableSpoofCloudToken = on; }]];
     [self.stack addArrangedSubview:ids];
 
