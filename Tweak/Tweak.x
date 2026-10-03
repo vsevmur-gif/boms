@@ -1199,52 +1199,116 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 }
 
 
-// MARK: - Identity-leak diagnostics (uncovered channels a persistent device id may come from)
+// MARK: - Full per-container isolation of the remaining identity channels
 //
-// Native model reads are spoofed, but the session binds to the REAL device — so the family/device
-// id is read from a store our container isolation does not cover. These hooks LOG (pass-through) the
-// channels that bypass NSUserDefaults/Keychain/FS isolation, so we can see which one carries the id:
-//   CFPreferences C API, iCloud key-value store, gethostuuid(), IORegistry (IOPlatformUUID/serial).
-// Filter Console by "miOS-id". fishhook needs only the symbol name, so IOKit is NOT linked.
+// Native model reads are spoofed, but the device IDENTITY (family/device id) can still be read from
+// stores the NSUserDefaults/Keychain/FS isolation does not cover. To make every container look like a
+// completely distinct device, isolate the rest too: CFPreferences (C API — bypasses the
+// NSUserDefaults ObjC hook), the iCloud key-value store, gethostuuid(), and IORegistry
+// (IOPlatformUUID/serial). Scoped so genuine system domains (com.apple.*, .GlobalPreferences,
+// AnyApplication) pass through untouched; the app's own domain and Meta/group domains are backed by
+// the per-container store, and the two hardware ids are replaced with a deterministic per-container
+// value. Filter Console by "miOS-id".
 static CFPropertyListRef (*orig_CFPrefCopyAppValue)(CFStringRef, CFStringRef) = NULL;
+static void (*orig_CFPrefSetAppValue)(CFStringRef, CFPropertyListRef, CFStringRef) = NULL;
 static CFPropertyListRef (*orig_CFPrefCopyValue)(CFStringRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static void (*orig_CFPrefSetValue)(CFStringRef, CFPropertyListRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static Boolean (*orig_CFPrefAppSync)(CFStringRef) = NULL;
 static int (*orig_gethostuuid)(uuid_t, const struct timespec *) = NULL;
 static CFTypeRef (*orig_IORegCreateCFProp)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t) = NULL;
 
-static void miosLogIdentity(const char *api, id a, id b) {
-    static int n = 0; if (n >= 150) return; n++;
-    @try {
-        BOOL dev = miosStrDeviceish(a) || miosStrDeviceish(b);
-        NSLog(@"[miOS-id] %s key=%@ domain=%@%@", api, a, b ?: @"-", dev ? @"  <== DEVICE-LIKE" : @"");
-    } @catch (__unused id e) {}
+// Deterministic 16 bytes derived from the container id — stable across launches, unique per container.
+static void miosContainerUUIDBytes(uuid_t out) {
+    const char *s = gContainerUUID.length ? gContainerUUID.UTF8String : "mios-default";
+    uint64_t h1 = 1469598103934665603ULL, h2 = 0x9e3779b97f4a7c15ULL;
+    for (const char *p = s; *p; p++) { h1 ^= (unsigned char)*p; h1 *= 1099511628211ULL; }
+    for (const char *p = s; *p; p++) { h2 ^= (unsigned char)*p; h2 *= 1099511628211ULL; }
+    memcpy(out, &h1, 8); memcpy(out + 8, &h2, 8);
+    out[6] = (out[6] & 0x0F) | 0x40;   // UUID v4 marker
+    out[8] = (out[8] & 0x3F) | 0x80;
+}
+static NSString *miosContainerUUIDString(void) {
+    uuid_t u; miosContainerUUIDBytes(u); uuid_string_t s; uuid_unparse_upper(u, s);
+    return [NSString stringWithUTF8String:s];
+}
+static NSString *miosContainerSerial(void) {
+    uuid_t u; miosContainerUUIDBytes(u);
+    static const char *abc = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+    char s[13]; for (int i = 0; i < 12; i++) s[i] = abc[u[i] % 34]; s[12] = 0;
+    return [NSString stringWithUTF8String:s];
+}
+// Isolate the app's own prefs domain + Meta/group domains; pass genuine system domains through.
+static BOOL miosPrefsDomainIsolated(CFStringRef appID) {
+    if (!appID || gUD == nil) return NO;
+    if (appID == kCFPreferencesCurrentApplication) return YES;
+    if (appID == kCFPreferencesAnyApplication) return NO;
+    NSString *d = (__bridge NSString *)appID;
+    if (![d isKindOfClass:[NSString class]] || d.length == 0) return NO;
+    NSString *l = d.lowercaseString;
+    if ([l hasPrefix:@"com.apple."] || [l isEqualToString:@".globalpreferences"]) return NO;
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length && [d isEqualToString:bid]) return YES;
+    if ([l containsString:@"facebook"] || [l containsString:@"burbn"] || [l containsString:@"instagram"] ||
+        [l containsString:@"meta"] || [l hasPrefix:@"group."]) return YES;
+    return NO;   // unknown non-Meta domain → leave alone (don't risk breaking a system read)
 }
 static CFPropertyListRef hook_CFPrefCopyAppValue(CFStringRef key, CFStringRef appID) {
-    miosLogIdentity("CFPreferencesCopyAppValue", (__bridge id)key, (__bridge id)appID);
+    if (key && miosPrefsDomainIsolated(appID)) {
+        id v = nil;
+        if (miosUDLookup((__bridge NSString *)key, &v)) return v ? (CFPropertyListRef)CFBridgingRetain(v) : NULL;
+    }
     return orig_CFPrefCopyAppValue ? orig_CFPrefCopyAppValue(key, appID) : NULL;
 }
+static void hook_CFPrefSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
+    if (key && miosPrefsDomainIsolated(appID)) { miosUDSet((__bridge NSString *)key, (__bridge id)value); return; }
+    if (orig_CFPrefSetAppValue) orig_CFPrefSetAppValue(key, value, appID);
+}
 static CFPropertyListRef hook_CFPrefCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
-    miosLogIdentity("CFPreferencesCopyValue", (__bridge id)key, (__bridge id)appID);
+    if (key && miosPrefsDomainIsolated(appID)) {
+        id v = nil;
+        if (miosUDLookup((__bridge NSString *)key, &v)) return v ? (CFPropertyListRef)CFBridgingRetain(v) : NULL;
+    }
     return orig_CFPrefCopyValue ? orig_CFPrefCopyValue(key, appID, user, host) : NULL;
 }
+static void hook_CFPrefSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    if (key && miosPrefsDomainIsolated(appID)) { miosUDSet((__bridge NSString *)key, (__bridge id)value); return; }
+    if (orig_CFPrefSetValue) orig_CFPrefSetValue(key, value, appID, user, host);
+}
+static Boolean hook_CFPrefAppSync(CFStringRef appID) {
+    if (miosPrefsDomainIsolated(appID)) { miosUDPersist(); return true; }
+    return orig_CFPrefAppSync ? orig_CFPrefAppSync(appID) : true;
+}
 static int hook_gethostuuid(uuid_t uu, const struct timespec *w) {
-    int r = orig_gethostuuid ? orig_gethostuuid(uu, w) : -1;
-    @try {
-        static int n = 0;
-        if (n < 8) { n++;
-            uuid_string_t s = {0}; if (r == 0) uuid_unparse(uu, s);
-            NSLog(@"[miOS-id] gethostuuid -> %s (rc=%d)  <== DEVICE-LIKE", s, r); }
-    } @catch (__unused id e) {}
-    return r;
+    if (uu && gContainerUUID.length) {
+        miosContainerUUIDBytes(uu);
+        static int n = 0; if (n < 2) { n++; NSLog(@"[miOS-id] gethostuuid -> per-container %@", miosContainerUUIDString()); }
+        return 0;
+    }
+    return orig_gethostuuid ? orig_gethostuuid(uu, w) : -1;
 }
 static CFTypeRef hook_IORegCreateCFProp(mach_port_t entry, CFStringRef key, CFAllocatorRef alloc, uint32_t opts) {
-    miosLogIdentity("IORegistryEntryCreateCFProperty", (__bridge id)key, nil);
+    if (key && gContainerUUID.length) {
+        NSString *k = (__bridge NSString *)key;
+        if ([k isEqualToString:@"IOPlatformUUID"])         return (CFTypeRef)CFBridgingRetain(miosContainerUUIDString());
+        if ([k isEqualToString:@"IOPlatformSerialNumber"]) return (CFTypeRef)CFBridgingRetain(miosContainerSerial());
+    }
     return orig_IORegCreateCFProp ? orig_IORegCreateCFProp(entry, key, alloc, opts) : NULL;
 }
 %hook NSUbiquitousKeyValueStore
 - (id)objectForKey:(NSString *)key {
-    static int n = 0;
-    if (n < 80) { n++;
-        NSLog(@"[miOS-id] iCloudKVS objectForKey:%@%@", key, miosStrDeviceish(key) ? @"  <== DEVICE-LIKE" : @""); }
+    id v = nil; if (gUD && miosUDLookup(key, &v)) return v;   // isolate iCloud KVS into the container
+    return %orig;
+}
+- (void)setObject:(id)value forKey:(NSString *)key {
+    if (gUD && [key isKindOfClass:[NSString class]]) { miosUDSet(key, value); return; }
+    %orig;
+}
+- (void)removeObjectForKey:(NSString *)key {
+    if (gUD && [key isKindOfClass:[NSString class]]) { miosUDSet(key, nil); return; }
+    %orig;
+}
+- (NSString *)stringForKey:(NSString *)key {
+    id v = nil; if (gUD && miosUDLookup(key, &v)) return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
     return %orig;
 }
 %end
@@ -2277,15 +2341,18 @@ static NSString *miosRewriteUA(NSString *ua) {
                 {"getifaddrs", (void *)hook_getifaddrs, (void **)&orig_getifaddrs},
             }, 1);
 
-        // Identity-leak diagnostics — always on (pass-through logging). Shows which uncovered channel
-        // IG reads a persistent device id from. fishhook needs only the symbol names.
+        // Full identity isolation — CFPreferences (read+write+sync), gethostuuid and IORegistry
+        // routed per-container. fishhook needs only the symbol names (IOKit not linked).
         rebind_symbols((struct rebinding[]){
             {"CFPreferencesCopyAppValue",         (void *)hook_CFPrefCopyAppValue, (void **)&orig_CFPrefCopyAppValue},
+            {"CFPreferencesSetAppValue",          (void *)hook_CFPrefSetAppValue,  (void **)&orig_CFPrefSetAppValue},
             {"CFPreferencesCopyValue",            (void *)hook_CFPrefCopyValue,    (void **)&orig_CFPrefCopyValue},
+            {"CFPreferencesSetValue",             (void *)hook_CFPrefSetValue,     (void **)&orig_CFPrefSetValue},
+            {"CFPreferencesAppSynchronize",       (void *)hook_CFPrefAppSync,      (void **)&orig_CFPrefAppSync},
             {"gethostuuid",                       (void *)hook_gethostuuid,        (void **)&orig_gethostuuid},
             {"IORegistryEntryCreateCFProperty",   (void *)hook_IORegCreateCFProp,  (void **)&orig_IORegCreateCFProp},
-        }, 4);
-        NSLog(@"[miOS-id] identity-leak diagnostics installed (CFPreferences/iCloudKVS/gethostuuid/IORegistry)");
+        }, 7);
+        NSLog(@"[miOS-id] full identity isolation installed (CFPreferences/iCloudKVS/gethostuuid/IORegistry) container=%@", miosContainerUUIDString());
 
         // ---- HOOK SELF-TEST (always-on NSLog) ----------------------------------------------
         // Decisive check of whether MSHookFunction actually works on this sideload runtime.
