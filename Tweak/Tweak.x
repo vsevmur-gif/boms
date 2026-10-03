@@ -1759,7 +1759,10 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
     return body;
 }
 %hook NSMutableURLRequest
-- (void)setHTTPBody:(NSData *)body { %orig(miosRewriteHTTPBody(body)); }
+- (void)setHTTPBody:(NSData *)body {
+    NSData *rewritten = miosRewriteHTTPBody(body);
+    %orig(rewritten);
+}
 %end
 // NOTE: NSURLSession uploadTaskWithRequest:fromData: is already hooked above (search
 // "%hook NSURLSession"); the body rewrite is wired into those existing methods to avoid a
