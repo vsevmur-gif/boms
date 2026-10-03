@@ -1,0 +1,88 @@
+name: Patch Instagram IPA
+
+# One-click IPA patcher. Open the Actions tab, pick this workflow, click
+# "Run workflow", and paste either:
+#   - a URL that returns your Instagram IPA (any direct link), OR
+#   - the artifact name of a prior workflow run that uploaded an IPA.
+# The patched IPA is uploaded as an artifact at the end of the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL that returns the Instagram IPA to patch (direct download link)"
+        required: false
+        default: ""
+      dylib_run_id:
+        description: "Workflow run id to pull miOS-dylib from (default: latest successful 'Build miOS for Instagram')"
+        required: false
+        default: ""
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install insert_dylib + ldid
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y zip unzip ca-certificates curl build-essential libplist-utils
+          # ldid from Procursus
+          curl -sSL -o /usr/local/bin/ldid \
+              https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          chmod +x /usr/local/bin/ldid
+          # insert_dylib — compile the C port that works on Linux
+          git clone --depth 1 https://github.com/Jhonsonlaid/insert_dylib /tmp/insert_dylib
+          clang -O2 -o /usr/local/bin/insert_dylib \
+              /tmp/insert_dylib/insert_dylib/main.c
+          chmod +x /usr/local/bin/insert_dylib
+
+      - name: Download the miOS.dylib (latest green build)
+        uses: actions/download-artifact@v4
+        if: ${{ inputs.dylib_run_id != '' }}
+        with:
+          name: miOS-dylib
+          path: dylib
+          run-id: ${{ inputs.dylib_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download the miOS.dylib (fallback — most recent build.yml run)
+        if: ${{ inputs.dylib_run_id == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          mkdir -p dylib
+          run_id="$(gh run list -w 'Build miOS for Instagram' --branch '${{ github.ref_name }}' \
+                      --status success --json databaseId --jq '.[0].databaseId')"
+          [ -n "$run_id" ] || { echo 'no green miOS build on this branch'; exit 1; }
+          gh run download "$run_id" -n miOS-dylib -D dylib
+
+      - name: Fetch the Instagram IPA
+        if: ${{ inputs.ipa_url != '' }}
+        run: |
+          set -eux
+          mkdir -p in
+          curl -L --fail -o in/Instagram.ipa '${{ inputs.ipa_url }}'
+          file in/Instagram.ipa
+
+      - name: Fail if no IPA provided
+        if: ${{ inputs.ipa_url == '' }}
+        run: |
+          echo '::error ::You must provide ipa_url. (Direct link to your Instagram IPA.)'
+          exit 1
+
+      - name: Patch IPA
+        run: |
+          chmod +x scripts/patch-ipa.sh
+          scripts/patch-ipa.sh in/Instagram.ipa dylib/miOS.dylib Instagram-miOS.ipa
+
+      - name: Upload patched IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Instagram-miOS-IPA
+          path: Instagram-miOS.ipa
+          if-no-files-found: error

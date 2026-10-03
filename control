@@ -1,0 +1,9 @@
+Package: com.mios.instagram
+Name: miOS for Instagram
+Version: 2.0.0
+Architecture: iphoneos-arm64
+Description: Multiple isolated Instagram containers — per-container data, keychain, device fingerprint and GPS. Single injectable dylib, no daemon, no companion app.
+Maintainer: miOS
+Author: miOS
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 14.0)
