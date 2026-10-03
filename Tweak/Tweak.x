@@ -77,6 +77,17 @@ static void miosStartWatchdog(void);
 // is precisely what triggers the crash. The fix is to SKIP the validation entirely.
 @interface IGCloudIDValidation : NSObject @end
 
+// IGUserAgent — the Swift singleton (_TtC11IGUserAgent11IGUserAgent) that builds Instagram's
+// User-Agent (device part "(iPhone17,1; iOS 18_5; Scale/3.00)"). It caches lazily, so if it built
+// its UA before our device hooks were up (or from a +load before our ctor) the real model stays in
+// the UA that registers the login session — which is what the Accounts Center page shows. Rewriting
+// the returned string here is timing-independent.
+@interface _TtC11IGUserAgent11IGUserAgent : NSObject
+- (NSString *)userAgent;
+- (NSString *)sanitizedUserAgent;
+- (NSString *)customUserAgent;
+@end
+
 @interface ASIdentifierManager : NSObject
 + (ASIdentifierManager *)sharedManager;
 - (NSUUID *)advertisingIdentifier;
@@ -2174,6 +2185,25 @@ static NSString *miosRewriteUA(NSString *ua) {
         NSLog(@"[miOS-ua] rewrote User-Agent -> %@", out);
     return out;
 }
+// IGUserAgent singleton — rewrite the composed UA at its source (timing-independent, defeats a
+// cached real-model UA). This is the string that registers the login session's device.
+%hook _TtC11IGUserAgent11IGUserAgent
+- (NSString *)userAgent {
+    NSString *ua = %orig;
+    if (!gDeviceSpoofActive) return ua;
+    NSString *nu = miosRewriteUA(ua);
+    static int lg = 0; if (lg < 4) { lg++; NSLog(@"[miOS-ua] IGUserAgent.userAgent in=%@", ua); }
+    return nu;
+}
+- (NSString *)sanitizedUserAgent {
+    NSString *ua = %orig;
+    return gDeviceSpoofActive ? miosRewriteUA(ua) : ua;
+}
+- (NSString *)customUserAgent {
+    NSString *ua = %orig;
+    return gDeviceSpoofActive ? miosRewriteUA(ua) : ua;
+}
+%end
 %hook NSMutableURLRequest
 - (void)setHTTPBody:(NSData *)body {
     NSData *rewritten = miosRewriteHTTPBody(body);
