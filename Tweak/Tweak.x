@@ -27,6 +27,8 @@
 #import <pthread.h>
 #import <mach-o/dyld.h>
 #import <mach/mach_time.h>
+#import <mach/mach.h>
+#import <uuid/uuid.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -1197,6 +1199,56 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 }
 
 
+// MARK: - Identity-leak diagnostics (uncovered channels a persistent device id may come from)
+//
+// Native model reads are spoofed, but the session binds to the REAL device — so the family/device
+// id is read from a store our container isolation does not cover. These hooks LOG (pass-through) the
+// channels that bypass NSUserDefaults/Keychain/FS isolation, so we can see which one carries the id:
+//   CFPreferences C API, iCloud key-value store, gethostuuid(), IORegistry (IOPlatformUUID/serial).
+// Filter Console by "miOS-id". fishhook needs only the symbol name, so IOKit is NOT linked.
+static CFPropertyListRef (*orig_CFPrefCopyAppValue)(CFStringRef, CFStringRef) = NULL;
+static CFPropertyListRef (*orig_CFPrefCopyValue)(CFStringRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static int (*orig_gethostuuid)(uuid_t, const struct timespec *) = NULL;
+static CFTypeRef (*orig_IORegCreateCFProp)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t) = NULL;
+
+static void miosLogIdentity(const char *api, id a, id b) {
+    static int n = 0; if (n >= 150) return; n++;
+    @try {
+        BOOL dev = miosStrDeviceish(a) || miosStrDeviceish(b);
+        NSLog(@"[miOS-id] %s key=%@ domain=%@%@", api, a, b ?: @"-", dev ? @"  <== DEVICE-LIKE" : @"");
+    } @catch (__unused id e) {}
+}
+static CFPropertyListRef hook_CFPrefCopyAppValue(CFStringRef key, CFStringRef appID) {
+    miosLogIdentity("CFPreferencesCopyAppValue", (__bridge id)key, (__bridge id)appID);
+    return orig_CFPrefCopyAppValue ? orig_CFPrefCopyAppValue(key, appID) : NULL;
+}
+static CFPropertyListRef hook_CFPrefCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    miosLogIdentity("CFPreferencesCopyValue", (__bridge id)key, (__bridge id)appID);
+    return orig_CFPrefCopyValue ? orig_CFPrefCopyValue(key, appID, user, host) : NULL;
+}
+static int hook_gethostuuid(uuid_t uu, const struct timespec *w) {
+    int r = orig_gethostuuid ? orig_gethostuuid(uu, w) : -1;
+    @try {
+        static int n = 0;
+        if (n < 8) { n++;
+            uuid_string_t s = {0}; if (r == 0) uuid_unparse(uu, s);
+            NSLog(@"[miOS-id] gethostuuid -> %s (rc=%d)  <== DEVICE-LIKE", s, r); }
+    } @catch (__unused id e) {}
+    return r;
+}
+static CFTypeRef hook_IORegCreateCFProp(mach_port_t entry, CFStringRef key, CFAllocatorRef alloc, uint32_t opts) {
+    miosLogIdentity("IORegistryEntryCreateCFProperty", (__bridge id)key, nil);
+    return orig_IORegCreateCFProp ? orig_IORegCreateCFProp(entry, key, alloc, opts) : NULL;
+}
+%hook NSUbiquitousKeyValueStore
+- (id)objectForKey:(NSString *)key {
+    static int n = 0;
+    if (n < 80) { n++;
+        NSLog(@"[miOS-id] iCloudKVS objectForKey:%@%@", key, miosStrDeviceish(key) ? @"  <== DEVICE-LIKE" : @""); }
+    return %orig;
+}
+%end
+
 // MARK: - Per-container HTTPS proxy (NSURLSessionConfiguration)
 
 // group ProxyHooks
@@ -2224,6 +2276,16 @@ static NSString *miosRewriteUA(NSString *ua) {
             rebind_symbols((struct rebinding[]){
                 {"getifaddrs", (void *)hook_getifaddrs, (void **)&orig_getifaddrs},
             }, 1);
+
+        // Identity-leak diagnostics — always on (pass-through logging). Shows which uncovered channel
+        // IG reads a persistent device id from. fishhook needs only the symbol names.
+        rebind_symbols((struct rebinding[]){
+            {"CFPreferencesCopyAppValue",         (void *)hook_CFPrefCopyAppValue, (void **)&orig_CFPrefCopyAppValue},
+            {"CFPreferencesCopyValue",            (void *)hook_CFPrefCopyValue,    (void **)&orig_CFPrefCopyValue},
+            {"gethostuuid",                       (void *)hook_gethostuuid,        (void **)&orig_gethostuuid},
+            {"IORegistryEntryCreateCFProperty",   (void *)hook_IORegCreateCFProp,  (void **)&orig_IORegCreateCFProp},
+        }, 4);
+        NSLog(@"[miOS-id] identity-leak diagnostics installed (CFPreferences/iCloudKVS/gethostuuid/IORegistry)");
 
         // ---- HOOK SELF-TEST (always-on NSLog) ----------------------------------------------
         // Decisive check of whether MSHookFunction actually works on this sideload runtime.
