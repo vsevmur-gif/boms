@@ -200,6 +200,8 @@ static CLLocation *spoofedLocationObject(void) {
 }
 
 // (groups removed — flat hooks + single %init)
+// EARLY identity hooks are in %group EarlyIdentity (initialized first in %ctor, before FS/keychain).
+
 %hook CLLocationManager
 - (CLLocation *)location {
     if (locationSpoofEnabled()) return spoofedLocationObject();
@@ -239,11 +241,11 @@ static CLLocation *spoofedLocationObject(void) {
 // MARK: - Device fingerprint (UIDevice / NSProcessInfo)
 
 // group DeviceSpoofHooks
+// MARK: - EarlyIdentity group — initialized FIRST in %ctor, before FS/keychain/App-Group,
+// so Instagram cannot cache real values from +load or early initializers.
+%group EarlyIdentity
 %hook UIDevice
 - (NSString *)systemVersion {
-    // DECISIVE one-shot probe: proves whether ObjC %hook (MSHookMessageEx) fires on this
-    // sideload runtime at all. If this line never appears in Console, Substrate's ObjC hooking
-    // is a no-op here and every %hook (battery/locale/carrier/vendorID/...) is dead.
     static dispatch_once_t once; dispatch_once(&once, ^{
         NSLog(@"[miOS-iso] HOOK UIDevice.systemVersion FIRED  enableSpoofSW=%d iosVersion=%@",
               (int)spoofBool(@"enableSpoofSoftwareVersion"), spoofStr(@"iosVersion"));
@@ -270,12 +272,20 @@ static CLLocation *spoofedLocationObject(void) {
     }
     return %orig;
 }
-- (NSString *)localizedModel {   // afhook spoofs this too — generic class string
+- (NSString *)localizedModel {
     if (spoofBool(@"enableSpoofDeviceModel")) {
         NSString *ident = spoofStr(@"deviceIdentifier");
         if ([ident hasPrefix:@"iPad"]) return @"iPad";
         if ([ident hasPrefix:@"iPod"]) return @"iPod touch";
         if ([ident hasPrefix:@"iPhone"]) return @"iPhone";
+    }
+    return %orig;
+}
+- (NSUUID *)identifierForVendor {
+    if (spoofBool(@"enableSpoofVendorID")) {
+        NSString *v = spoofStr(@"vendorID");
+        NSUUID *u = v.length ? [[NSUUID alloc] initWithUUIDString:v] : nil;
+        if (u) return u;
     }
     return %orig;
 }
@@ -316,7 +326,80 @@ static CLLocation *spoofedLocationObject(void) {
     return %orig;
 }
 %end
-// end DeviceSpoofHooks
+%hook ASIdentifierManager
+- (NSUUID *)advertisingIdentifier {
+    if (spoofBool(@"enableSpoofAdvertisingID")) {
+        NSString *v = spoofStr(@"advertisingID");
+        NSUUID *u = v.length ? [[NSUUID alloc] initWithUUIDString:v] : nil;
+        if (u) return u;
+    }
+    return %orig;
+}
+- (BOOL)isAdvertisingTrackingEnabled {
+    if (spoofBool(@"enableSpoofAdvertisingID")) return NO;
+    return %orig;
+}
+%end
+%hook UIScreen
+- (CGRect)nativeBounds {
+    if (gcScreenW > 0 && gcScreenH > 0) return CGRectMake(0, 0, gcScreenW, gcScreenH);
+    return %orig;
+}
+- (CGFloat)nativeScale {
+    if (gcScreenNativeScale > 0) return gcScreenNativeScale;
+    return %orig;
+}
+%end
+%hook DCDevice
++ (BOOL)isSupported {
+    BOOL on = spoofBool(@"enableSpoofDeviceCheck");
+    if (on) return NO;
+    return %orig;
+}
+- (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) {
+            NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1
+                                           userInfo:@{NSLocalizedDescriptionKey: @"DeviceCheck unavailable"}];
+            completion(nil, err);
+        }
+        return;
+    }
+    %orig;
+}
+%end
+%hook DCAppAttestService
+- (BOOL)isSupported {
+    if (spoofBool(@"enableSpoofDeviceCheck")) return NO;
+    return %orig;
+}
+- (void)generateKeyWithCompletionHandler:(void (^)(NSString *keyId, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:2
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
+        return;
+    }
+    %orig;
+}
+- (void)attestKey:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *attestation, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:3
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
+        return;
+    }
+    %orig;
+}
+- (void)generateAssertion:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *assertion, NSError *error))completion {
+    if (spoofBool(@"enableSpoofDeviceCheck")) {
+        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:4
+                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
+        return;
+    }
+    %orig;
+}
+%end
+%end
+// end EarlyIdentity
 
 // MARK: - Battery / Brightness / Orientation / Proximity
 
@@ -352,17 +435,6 @@ static CLLocation *spoofedLocationObject(void) {
 %hook UIScreen
 - (CGFloat)brightness {
     if (spoofBool(@"enableSpoofBrightness")) return (CGFloat)spoofDbl(@"brightnessLevel");
-    return %orig;
-}
-// nativeBounds is always portrait pixels and is what IG's media_layout_screen_* telemetry reads.
-// Only spoofed when we have a known resolution for the target model; layout APIs (-bounds/-scale)
-// are deliberately left real so the UI renders correctly.
-- (CGRect)nativeBounds {
-    if (gcScreenW > 0 && gcScreenH > 0) return CGRectMake(0, 0, gcScreenW, gcScreenH);
-    return %orig;
-}
-- (CGFloat)nativeScale {
-    if (gcScreenNativeScale > 0) return gcScreenNativeScale;
     return %orig;
 }
 %end
@@ -452,96 +524,7 @@ static CLLocation *spoofedLocationObject(void) {
 %end
 // end CarrierHooks
 
-// MARK: - Identifiers (IDFV / IDFA / DeviceCheck / iCloud)
-
-// group IdentifierSpoofHooks
-%hook UIDevice
-- (NSUUID *)identifierForVendor {
-    if (spoofBool(@"enableSpoofVendorID")) {
-        NSString *v = spoofStr(@"vendorID");
-        NSUUID *u = v.length ? [[NSUUID alloc] initWithUUIDString:v] : nil;
-        if (u) return u;
-    }
-    return %orig;
-}
-%end
-%hook ASIdentifierManager
-- (NSUUID *)advertisingIdentifier {
-    if (spoofBool(@"enableSpoofAdvertisingID")) {
-        NSString *v = spoofStr(@"advertisingID");
-        NSUUID *u = v.length ? [[NSUUID alloc] initWithUUIDString:v] : nil;
-        if (u) return u;
-    }
-    return %orig;
-}
-- (BOOL)isAdvertisingTrackingEnabled {
-    if (spoofBool(@"enableSpoofAdvertisingID")) return NO;
-    return %orig;
-}
-%end
-// DeviceCheck (DCDevice) — per-container toggle (enableSpoofDeviceCheck). When on, report the
-// device as not DeviceCheck-capable and never produce a token, so the app cannot send Apple's
-// hardware-attested per-device bits that would tie this container to the real physical device.
-// (App Attest / DCAppAttestService is still left untouched — it refuses to attest a resigned app
-// anyway, and failing it loudly is worse than not using it.)
-%hook DCDevice
-+ (BOOL)isSupported {
-    BOOL on = spoofBool(@"enableSpoofDeviceCheck");
-    NSLog(@"[miOS-att] DCDevice.isSupported called (spoof=%d -> %@)", (int)on, on ? @"NO" : @"orig");
-    if (on) return NO;
-    return %orig;
-}
-- (void)generateTokenWithCompletionHandler:(void (^)(NSData *token, NSError *error))completion {
-    NSLog(@"[miOS-att] DCDevice.generateToken called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
-    if (spoofBool(@"enableSpoofDeviceCheck")) {
-        if (completion) {
-            NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1
-                                           userInfo:@{NSLocalizedDescriptionKey: @"DeviceCheck unavailable"}];
-            completion(nil, err);
-        }
-        return;
-    }
-    %orig;
-}
-%end
-// App Attest (DCAppAttestService) — the OTHER Secure-Enclave attestation. Like DeviceCheck, a valid
-// attestation cryptographically proves THIS physical device, so Apple (and thus Meta server-side)
-// can correlate every container to one phone. Gated by the same enableSpoofDeviceCheck toggle: make
-// it unavailable and fail key/attestation generation so no hardware attestation is produced.
-%hook DCAppAttestService
-- (BOOL)isSupported {
-    BOOL on = spoofBool(@"enableSpoofDeviceCheck");
-    NSLog(@"[miOS-att] AppAttest.isSupported called (spoof=%d -> %@)", (int)on, on ? @"NO" : @"orig");
-    if (on) return NO;
-    return %orig;
-}
-- (void)generateKeyWithCompletionHandler:(void (^)(NSString *keyId, NSError *error))completion {
-    NSLog(@"[miOS-att] AppAttest.generateKey called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
-    if (spoofBool(@"enableSpoofDeviceCheck")) {
-        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:2
-                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
-        return;
-    }
-    %orig;
-}
-- (void)attestKey:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *attestation, NSError *error))completion {
-    NSLog(@"[miOS-att] AppAttest.attestKey called (spoof=%d)", (int)spoofBool(@"enableSpoofDeviceCheck"));
-    if (spoofBool(@"enableSpoofDeviceCheck")) {
-        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:3
-                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
-        return;
-    }
-    %orig;
-}
-- (void)generateAssertion:(NSString *)keyId clientDataHash:(NSData *)hash completionHandler:(void (^)(NSData *assertion, NSError *error))completion {
-    if (spoofBool(@"enableSpoofDeviceCheck")) {
-        if (completion) completion(nil, [NSError errorWithDomain:@"com.apple.devicecheck.error" code:4
-                                       userInfo:@{NSLocalizedDescriptionKey: @"App Attest unavailable"}]);
-        return;
-    }
-    %orig;
-}
-%end
+// MARK: - Identifiers (IDFV / IDFA / DeviceCheck moved to %group EarlyIdentity above)
 
 // Network diagnostics. Logs every outbound NSURLSession request. During the registration
 // spinner the LAST few NET lines show which endpoint the app is hitting and whether it's
@@ -2469,6 +2452,12 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
             }, 3);
         }
 
+        // ObjC identity hooks IMMEDIATELY after C-level fishhooks — before FS/keychain/App-Group
+        // so Instagram cannot cache real IDFV/model/screen from +load or early initializers.
+        dlopen("/System/Library/Frameworks/DeviceCheck.framework/DeviceCheck", RTLD_LAZY);
+        %init(EarlyIdentity);
+        NSLog(@"[miOS-time] EarlyIdentity ObjC hooks INSTALLED @%.0fms (IDFV/IDFA/model/screen/DeviceCheck)", miosMsSinceStart());
+
         // 1. Filesystem isolation first.
         miosInstallContainerFS(active);
 
@@ -2502,12 +2491,8 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
         // installed FIRST, above — see "DEVICE SPOOF FIRST" — before FS/keychain, to shrink the
         // pre-read window.)
 
-        // Ensure DeviceCheck.framework is loaded so the %hook DCDevice below resolves the class at
-        // %init even if the app links it lazily (the hook self-gates on enableSpoofDeviceCheck).
-        dlopen("/System/Library/Frameworks/DeviceCheck.framework/DeviceCheck", RTLD_LAZY);
-
-        // Bind the remaining always-on ObjC hooks (UIDevice/NSProcessInfo/UIScreen/network/etc. —
-        // each self-gates with its own spoofBool(...) check).
+        // Bind the remaining ObjC hooks (battery/brightness/locale/carrier/location/network/
+        // WKWebView/IGUserAgent/NSMutableURLRequest — non-identity hooks that can wait).
         %init;
 
         // Diagnostic: did the IGUserAgent %hook have a class to attach to, and what are the real
