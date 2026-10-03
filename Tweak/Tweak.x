@@ -1200,7 +1200,18 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 // MARK: - Per-container HTTPS proxy (NSURLSessionConfiguration)
 
 // group ProxyHooks
+static NSString *miosRewriteUA(NSString *ua);   // defined with the request hooks below
 %hook NSURLSessionConfiguration
+- (void)setHTTPAdditionalHeaders:(NSDictionary *)headers {
+    if (gDeviceSpoofActive && [headers isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *m = [headers mutableCopy];
+        for (id k in headers)
+            if ([k isKindOfClass:[NSString class]] && [k caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
+                m[k] = miosRewriteUA(headers[k]);
+        %orig(m); return;
+    }
+    %orig;
+}
 + (NSURLSessionConfiguration *)defaultSessionConfiguration {
     NSURLSessionConfiguration *c = %orig;
     NSString *host = spoofStr(@"proxyHost"); NSInteger port = spoofInt(@"proxyPort");
@@ -1990,10 +2001,58 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
     }
     return body;
 }
+// User-Agent header rewrite — TIMING-INDEPENDENT. Even if IGUserAgent (a lazy Swift singleton)
+// cached its UA string before our hooks installed (or a framework +load read hw.machine before our
+// ctor), the UA leaves the app through a request header, which we rewrite here at send time. The IG
+// UA embeds the model identifier (e.g. iPhone17,1), the iOS version (16_7 / 16.7) and the screen
+// resolution — swap the real values for the spoofed ones. This does not depend on winning any race.
+static NSString *miosRewriteUA(NSString *ua) {
+    if (!gDeviceSpoofActive || ![ua isKindOfClass:[NSString class]] || ua.length == 0) return ua;
+    NSString *out = ua;
+    NSString *spM = spoofStr(@"deviceIdentifier");
+    if (gRealMachineNS.length && spM.length)
+        out = [out stringByReplacingOccurrencesOfString:gRealMachineNS withString:spM];
+    if (spoofBool(@"enableSpoofSoftwareVersion")) {
+        NSString *spIOS = spoofStr(@"iosVersion");
+        if (gRealIOSNS.length && spIOS.length) {
+            NSString *realU = [gRealIOSNS stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+            NSString *spU   = [spIOS      stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+            out = [out stringByReplacingOccurrencesOfString:realU withString:spU];   // 16_7 form
+            out = [out stringByReplacingOccurrencesOfString:gRealIOSNS withString:spIOS]; // 16.7 form
+        }
+    }
+    if (out != ua && ![out isEqualToString:ua])
+        NSLog(@"[miOS-ua] rewrote User-Agent -> %@", out);
+    return out;
+}
 %hook NSMutableURLRequest
 - (void)setHTTPBody:(NSData *)body {
     NSData *rewritten = miosRewriteHTTPBody(body);
     %orig(rewritten);
+}
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
+        [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
+        %orig(miosRewriteUA(value), field); return;
+    }
+    %orig;
+}
+- (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
+        [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
+        %orig(miosRewriteUA(value), field); return;
+    }
+    %orig;
+}
+- (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headers {
+    if (gDeviceSpoofActive && [headers isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *m = [headers mutableCopy];
+        for (NSString *k in headers)
+            if ([k isKindOfClass:[NSString class]] && [k caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
+                m[k] = miosRewriteUA(headers[k]);
+        %orig(m); return;
+    }
+    %orig;
 }
 %end
 // NOTE: NSURLSession uploadTaskWithRequest:fromData: is already hooked above (search
@@ -2076,6 +2135,43 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
         miosLog(@"active container=%@ enableSpoof=%d — installing isolation",
                 gContainerUUID, (int)active.enableSpoof);
 
+        // DEVICE SPOOF FIRST — build the spoof cache, capture the real device, and install the
+        // low-level device hooks (sysctl/uname + the MGCopyAnswer import rebind) BEFORE any other
+        // isolation work, so the fingerprint is spoofed as early as the ctor allows. IGUserAgent
+        // reads hw.machine via sysctlbyname, so getting that fishhook in first shrinks the window.
+        // (Our ctor already runs before the app's main(); the timing-independent guarantee is the
+        // User-Agent / body rewrite on outgoing requests below.)
+        miosBuildSpoofCache();
+        if (gDeviceSpoofActive) {
+            char m[128] = {0}; size_t ml = sizeof(m);
+            if (sysctlbyname("hw.machine", m, &ml, NULL, 0) == 0 && m[0])
+                gRealMachineNS = [NSString stringWithUTF8String:m];
+            char v[128] = {0}; size_t vl = sizeof(v);
+            if (sysctlbyname("kern.osproductversion", v, &vl, NULL, 0) == 0 && v[0])
+                gRealIOSNS = [NSString stringWithUTF8String:v];
+            void *mgH = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+            if (mgH) {
+                CFTypeRef (*mg)(CFStringRef) = (CFTypeRef (*)(CFStringRef))dlsym(mgH, "MGCopyAnswer");
+                if (mg) {
+                    CFTypeRef fn = mg(CFSTR("marketing-name"));
+                    if (fn && CFGetTypeID(fn) == CFStringGetTypeID()) gRealFriendlyNS = (__bridge_transfer NSString *)fn;
+                    else if (fn) CFRelease(fn);
+                }
+            }
+            NSLog(@"[miOS-iso] captured REAL device: machine=%@ ios=%@ friendly=%@",
+                  gRealMachineNS, gRealIOSNS, gRealFriendlyNS);
+            rebind_symbols((struct rebinding[]){
+                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+                {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
+                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
+            }, 3);
+            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
+                rebind_symbols((struct rebinding[]){
+                    {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
+                }, 1);
+            NSLog(@"[miOS-time] device hooks INSTALLED @%.0fms (early, before FS/keychain)", miosMsSinceStart());
+        }
+
         // 1. Filesystem isolation first.
         miosInstallContainerFS(active);
 
@@ -2105,57 +2201,15 @@ static NSData *miosRewriteHTTPBody(NSData *body) {
         // 3. First-launch App-Group wipe.
         miosResetContainerCachesOnce(gContainerUUID);
 
-        // 4. Precompute spoof cache + install hooks (gDeviceSpoofActive stays NO when spoof off).
-        miosBuildSpoofCache();
+        // (Device spoof cache, real-device capture, and the sysctl/uname/MGCopyAnswer hooks were
+        // installed FIRST, above — see "DEVICE SPOOF FIRST" — before FS/keychain, to shrink the
+        // pre-read window.)
 
-        // 4b. Capture the REAL device values NOW — before any sysctl/MGCopyAnswer hook is installed
-        // below — so the telemetry JSON rewrite can swap them out of outgoing login/analytics bodies.
-        if (gDeviceSpoofActive) {
-            char m[128] = {0}; size_t ml = sizeof(m);
-            if (sysctlbyname("hw.machine", m, &ml, NULL, 0) == 0 && m[0])
-                gRealMachineNS = [NSString stringWithUTF8String:m];
-            char v[128] = {0}; size_t vl = sizeof(v);
-            if (sysctlbyname("kern.osproductversion", v, &vl, NULL, 0) == 0 && v[0])
-                gRealIOSNS = [NSString stringWithUTF8String:v];
-            void *mgH = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
-            if (mgH) {
-                CFTypeRef (*mg)(CFStringRef) = (CFTypeRef (*)(CFStringRef))dlsym(mgH, "MGCopyAnswer");
-                if (mg) {
-                    CFTypeRef fn = mg(CFSTR("marketing-name"));
-                    if (fn && CFGetTypeID(fn) == CFStringGetTypeID()) gRealFriendlyNS = (__bridge_transfer NSString *)fn;
-                    else if (fn) CFRelease(fn);
-                }
-            }
-            NSLog(@"[miOS-iso] captured REAL device: machine=%@ ios=%@ friendly=%@",
-                  gRealMachineNS, gRealIOSNS, gRealFriendlyNS);
-        }
-
-        // Bind the always-on hooks (device/identifier/network/etc. — each self-gates with
-        // its own spoofBool(...) check).
+        // Bind the remaining always-on ObjC hooks (UIDevice/NSProcessInfo/UIScreen/network/etc. —
+        // each self-gates with its own spoofBool(...) check).
         %init;
 
         // DeviceCheck and App Attest are not hooked at all (removed to match Blaze).
-
-        // Low-level C hooks via fishhook (like Blaze) so they fire on sideload without Substrate.
-        // We cover EVERY path the app can read the device through:
-        //   - sysctlbyname("hw.machine"/"hw.model")  — string-keyed sysctl
-        //   - sysctl({CTL_HW, HW_MACHINE/HW_MODEL})  — array-keyed sysctl (IG uses this form too!)
-        //   - uname()                                 — utsname.machine
-        // MobileGestalt: ONLY the safe import rebind of MGCopyAnswer (what IG shows on screen and
-        // sends is the MG marketing-name/ProductType, not hw.machine). The crash-causing process-
-        // wide dlsym("MGCopyAnswer") rebind and the arm64e Substitute inline hook are NOT used.
-        if (gDeviceSpoofActive) {
-            rebind_symbols((struct rebinding[]){
-                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
-                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-            }, 3);
-            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
-                rebind_symbols((struct rebinding[]){
-                    {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
-                }, 1);
-            NSLog(@"[miOS-time] device hooks (sysctl/uname/MGCopyAnswer) INSTALLED @%.0fms", miosMsSinceStart());
-        }
 
         // getifaddrs — Wi-Fi + cellular IP spoofing (Blaze fishhooks this too).
         if (spoofBool(@"enableSpoofWiFi") || spoofBool(@"enableSpoofCellular"))
