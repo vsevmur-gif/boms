@@ -1679,13 +1679,25 @@ static NSString *miosValidAccessGroup(void) {
 }
 %end
 %hook FBSDKKeychainStore
-- (NSString *)accessGroup { NSString *g = miosValidAccessGroup(); return g ?: %orig; }
+- (NSString *)accessGroup {
+    NSString *g = miosValidAccessGroup();
+    if (g) return g;
+    return %orig;
+}
 %end
 %hook FBKeychainItemController
-- (NSString *)accessGroup { NSString *g = miosValidAccessGroup(); return g ?: %orig; }
+- (NSString *)accessGroup {
+    NSString *g = miosValidAccessGroup();
+    if (g) return g;
+    return %orig;
+}
 %end
 %hook UICKeyChainStore
-- (NSString *)accessGroup { NSString *g = miosValidAccessGroup(); return g ?: %orig; }
+- (NSString *)accessGroup {
+    NSString *g = miosValidAccessGroup();
+    if (g) return g;
+    return %orig;
+}
 %end
 %end
 // end group SideloadFixes
