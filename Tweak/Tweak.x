@@ -2,6 +2,7 @@
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <SafariServices/SafariServices.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -364,11 +365,8 @@ static CLLocation *spoofedLocationObject(void) {
     if (spoofBool(@"enableSpoofAdvertisingID")) return NO;
     return %orig;
 }
-- (BOOL)disableAfmaIdfaCollection {
-    if (spoofBool(@"enableSpoofAdvertisingID")) return YES;
-    return %orig;
-}
 %end
+
 %hook UIScreen
 - (CGRect)nativeBounds {
     if (gcScreenW > 0 && gcScreenH > 0) return CGRectMake(0, 0, gcScreenW, gcScreenH);
@@ -452,6 +450,12 @@ static CLLocation *spoofedLocationObject(void) {
 + (BOOL)isDeviceJailbroken { return NO; }
 - (BOOL)isJailbroken { return NO; }
 %end
+%hook GADMobileAds
+- (BOOL)disableAfmaIdfaCollection {
+    if (spoofBool(@"enableSpoofAdvertisingID")) return YES;
+    return %orig;
+}
+%end
 
 // MARK: - Background Task Blocker — prevents Instagram background telemetry
 %group BackgroundBlocker
@@ -483,9 +487,10 @@ static BOOL gCameraHookerEnabled = NO;
     if (gCameraHookerEnabled && gCachedPhotoData) {
         NSLog(@"[miOS-cam] Using cached photo instead of camera capture");
         if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
+            __weak AVCapturePhotoOutput *weakSelf = (AVCapturePhotoOutput *)self;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                [delegate captureOutput:(id)self didFinishProcessingPhoto:nil error:nil];
+                [delegate captureOutput:weakSelf didFinishProcessingPhoto:nil error:nil];
             });
         }
         return;
@@ -1237,7 +1242,7 @@ static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
 static uint32_t (*orig_dyld_image_count)(void) = NULL;
 
 static BOOL miosIsMiOSImage(uint32_t idx) {
-    const char *name = _dyld_get_image_name(idx);
+    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(idx) : _dyld_get_image_name(idx);
     if (!name) return NO;
     return (strstr(name, "miOS") != NULL || strstr(name, "nomix") != NULL ||
             strstr(name, "CydiaSubstrate") != NULL || strstr(name, "substrate") != NULL);
