@@ -168,6 +168,20 @@ FOUNDATION_EXPORT NSString *MiOSBaseDir(void);          // …/Documents/miOS
 - (void)randomizeLocale;
 - (void)randomizeCellular;
 - (void)randomizeKernelVersion;
+- (void)randomizeLocation;
+
+#pragma mark - Token extraction (Instagram API headers captured from live traffic)
+
+// Save a snapshot of IG API headers captured from NSURLSession traffic. Called from Tweak.x.
++ (void)recordIGHeaders:(NSDictionary<NSString *, NSString *> *)headers
+          forContainerID:(NSString *)containerID;
+
+// Return the latest captured headers for this container, nil if nothing was ever captured.
+- (NSDictionary *)capturedIGHeaders;
+
+// Format headers in Instagram Access Manager (IAM) layout, ready to paste into a token manager.
+// Returns nil if no usable headers are stored.
+- (NSString *)extractIAMToken;
 
 #pragma mark - Runtime (consumed by hooks)
 

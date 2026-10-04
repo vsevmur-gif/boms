@@ -1607,6 +1607,25 @@ static void MiOSPresentContainerActions(UIViewController *host, MiOSContainer *m
         handler:^(UIAlertAction *x){ [m save]; [MiOSContainer setActiveContainerID:m.identifier]; [m containerRootEnsureCreated:YES]; exit(0); }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Edit fingerprint" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x){ if (openEditor) openEditor(m); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Extract token" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *x){
+            NSString *iam = [m extractIAMToken];
+            if (iam.length) {
+                [UIPasteboard generalPasteboard].string = iam;
+                [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+                UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"Token copied"
+                    message:@"The Instagram IAM token for this container was copied to the clipboard."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [ok addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [host presentViewController:ok animated:YES completion:nil];
+            } else {
+                UIAlertController *no = [UIAlertController alertControllerWithTitle:@"No token yet"
+                    message:@"No Instagram token has been captured for this container. Activate it and open Instagram so the hooks can capture live API traffic, then try again."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [no addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [host presentViewController:no animated:YES completion:nil];
+            }
+        }]];
     if (!isDefault) {
         [a addAction:[UIAlertAction actionWithTitle:@"Rename" style:UIAlertActionStyleDefault
             handler:^(UIAlertAction *x){

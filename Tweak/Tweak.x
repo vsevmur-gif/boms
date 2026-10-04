@@ -636,18 +636,74 @@ static void miosLogReq(NSString *tag, NSURLRequest *req) {
     } @catch (__unused id e) {}
 }
 static NSData *miosRewriteHTTPBody(NSData *body);   // defined after the device-spoof cache
+
+// Token-dumper: capture Authorization / MID / WWW-Claim / DS-USER-ID headers from
+// Instagram's live API traffic and persist them under the active container's root. The
+// MiOS UI reads this snapshot via -[MiOSContainer extractIAMToken] for the Extract Token
+// action. We only save when values actually change to keep writes rare.
+static NSMutableDictionary<NSString *, NSString *> *gLastCapturedIGHeaders = nil;
+static NSTimeInterval gLastCapturedIGSave = 0;
+static void miosCaptureIGHeaders(NSURLRequest *req) {
+    @try {
+        if (!req) return;
+        NSString *host = req.URL.host.lowercaseString;
+        if (!host.length) return;
+        // Instagram API hosts only — avoids spam from third-party SDKs / Meta Analytics.
+        if (!([host hasSuffix:@"instagram.com"] || [host hasSuffix:@"cdninstagram.com"] ||
+              [host containsString:@"i.instagram.com"] || [host containsString:@"b.i.instagram.com"] ||
+              [host containsString:@"graph.instagram.com"])) return;
+
+        NSDictionary *hdrs = req.allHTTPHeaderFields;
+        if (!hdrs.count) return;
+
+        static NSArray *keys = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            keys = @[@"Authorization", @"IG-U-DS-USER-ID", @"X-IG-DS-USER-ID",
+                     @"X-MID", @"X-IG-WWW-Claim", @"X-IG-Device-ID",
+                     @"User-Agent", @"IG-U-IG-DIRECT-REGION-HINT",
+                     @"X-IG-Family-Device-ID", @"X-Bloks-Version-Id"];
+        });
+
+        if (!gLastCapturedIGHeaders) gLastCapturedIGHeaders = [NSMutableDictionary dictionary];
+        BOOL changed = NO;
+        for (NSString *k in keys) {
+            NSString *v = hdrs[k];
+            if (![v isKindOfClass:[NSString class]] || !v.length) continue;
+            NSString *cur = gLastCapturedIGHeaders[k];
+            if (![cur isEqualToString:v]) {
+                gLastCapturedIGHeaders[k] = v;
+                changed = YES;
+            }
+        }
+        if (!changed) return;
+
+        // Throttle disk writes to once every 10s even if things keep changing.
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - gLastCapturedIGSave < 10.0) return;
+        gLastCapturedIGSave = now;
+
+        NSString *cid = gContainerUUID;
+        if (!cid.length) return;
+        NSDictionary *snapshot = [gLastCapturedIGHeaders copy];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [MiOSContainer recordIGHeaders:snapshot forContainerID:cid];
+        });
+    } @catch (__unused id e) {}
+}
+
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    miosLogReq(@"data", request); return %orig;
+    miosLogReq(@"data", request); miosCaptureIGHeaders(request); return %orig;
 }
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))h {
-    miosLogReq(@"data+cb", request); return %orig;
+    miosLogReq(@"data+cb", request); miosCaptureIGHeaders(request); return %orig;
 }
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
-    miosLogReq(@"upload", request); return %orig(request, miosRewriteHTTPBody(bodyData));
+    miosLogReq(@"upload", request); miosCaptureIGHeaders(request); return %orig(request, miosRewriteHTTPBody(bodyData));
 }
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))h {
-    miosLogReq(@"upload+cb", request); return %orig(request, miosRewriteHTTPBody(bodyData), h);
+    miosLogReq(@"upload+cb", request); miosCaptureIGHeaders(request); return %orig(request, miosRewriteHTTPBody(bodyData), h);
 }
 %end
 
@@ -1595,6 +1651,55 @@ static NSString *miosRewriteUA(NSString *ua);   // defined with the request hook
 // the spoofed device. Only properties that real iOS Safari actually exposes are touched (no
 // navigator.deviceMemory — Safari lacks it, so adding it would itself be a tell), and window.inner*
 // is left alone so page layout is not disturbed.
+// Rewrite a WebKit-style UA string. WebKit UA looks like:
+//   Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 ...
+// Unlike IG's own UA, it does NOT contain the hw.machine (iPhone17,1), so miosRewriteUA's
+// machine-name replacement misses it. This function handles the "iPhone OS XX_Y" pattern
+// and the "Version/XX.Y" pattern that WebKit uses.
+static NSString *miosRewriteWebKitUA(NSString *ua) {
+    if (!gDeviceSpoofActive || ![ua isKindOfClass:[NSString class]] || ua.length == 0) return ua;
+    NSString *out = ua;
+    // Also apply the standard IG-style rewrite (machine name, iOS version in dotted form)
+    out = miosRewriteUA(out);
+    // WebKit uses "iPhone OS 18_2" (underscored) — miosRewriteUA already handles the underscore
+    // form, but only if gRealIOSNS is set. Double-check by also doing a regex replacement.
+    if (spoofBool(@"enableSpoofSoftwareVersion")) {
+        NSString *spIOS = spoofStr(@"iosVersion");
+        if (spIOS.length) {
+            NSString *spU = [spIOS stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+            @try {
+                NSRegularExpression *rx = [NSRegularExpression
+                    regularExpressionWithPattern:@"iPhone OS \\d+_\\d+(_\\d+)?"
+                    options:0 error:nil];
+                if (rx) out = [rx stringByReplacingMatchesInString:out options:0
+                    range:NSMakeRange(0, out.length)
+                    withTemplate:[NSString stringWithFormat:@"iPhone OS %@", spU]];
+                NSRegularExpression *vr = [NSRegularExpression
+                    regularExpressionWithPattern:@"Version/\\d+\\.\\d+(\\.\\d+)?"
+                    options:0 error:nil];
+                if (vr) out = [vr stringByReplacingMatchesInString:out options:0
+                    range:NSMakeRange(0, out.length)
+                    withTemplate:[NSString stringWithFormat:@"Version/%@", spIOS]];
+            } @catch (__unused id e) {}
+        }
+    }
+    return out;
+}
+
+// Build a complete spoofed WebKit UA from scratch. Used when WKWebView has no customUserAgent
+// set, so we need to construct the full string rather than rewriting an existing one.
+// Format: Mozilla/5.0 (iPhone; CPU iPhone OS <ver> like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/<ver> Mobile/15E148 Safari/604.1
+static NSString *miosBuildSpoofedWebKitUA(void) {
+    if (!gDeviceSpoofActive) return nil;
+    NSString *ios = spoofBool(@"enableSpoofSoftwareVersion") ? spoofStr(@"iosVersion") : nil;
+    if (!ios.length) return nil;
+    NSString *iosU = [ios stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    return [NSString stringWithFormat:
+        @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
+        @"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1",
+        iosU, ios];
+}
+
 static NSString *miosWebSpoofJS(void) {
     if (!gDeviceSpoofActive) return nil;
     NSMutableString *js = [NSMutableString stringWithString:@"(function(){"];
@@ -1641,16 +1746,38 @@ static NSString *miosWebSpoofJS(void) {
             NSLog(@"[miOS-web] NOT injected (js=%d cfg=%d)", js != nil, configuration != nil);
         }
     } @catch (__unused id e) {}
-    return %orig;
+    WKWebView *wv = %orig;
+    @try {
+        if (gDeviceSpoofActive && wv) {
+            NSString *existing = wv.customUserAgent;
+            if (existing.length) {
+                wv.customUserAgent = miosRewriteWebKitUA(existing);
+                NSLog(@"[miOS-web] proactive customUserAgent rewrite: %@", wv.customUserAgent);
+            } else {
+                NSString *spoofUA = miosBuildSpoofedWebKitUA();
+                if (spoofUA.length) {
+                    wv.customUserAgent = spoofUA;
+                    NSLog(@"[miOS-web] proactive customUserAgent SET: %@", spoofUA);
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+    return wv;
 }
 - (void)setCustomUserAgent:(NSString *)ua {
     if (gDeviceSpoofActive && [ua isKindOfClass:[NSString class]] && ua.length > 0) {
-        NSString *rewritten = miosRewriteUA(ua);
+        NSString *rewritten = miosRewriteWebKitUA(ua);
         NSLog(@"[miOS-ua] WKWebView setCustomUserAgent in=%@ out=%@", ua, rewritten);
         %orig(rewritten);
         return;
     }
     %orig;
+}
+- (NSString *)customUserAgent {
+    NSString *ua = %orig;
+    if (gDeviceSpoofActive && [ua isKindOfClass:[NSString class]] && ua.length > 0)
+        return miosRewriteWebKitUA(ua);
+    return ua;
 }
 - (void)loadRequest:(NSURLRequest *)request {
     NSLog(@"[miOS-web] WKWebView loadRequest %@", request.URL.absoluteString);
@@ -1660,12 +1787,18 @@ static NSString *miosWebSpoofJS(void) {
 %hook WKWebViewConfiguration
 - (void)setApplicationNameForUserAgent:(NSString *)name {
     if (gDeviceSpoofActive && [name isKindOfClass:[NSString class]] && name.length > 0) {
-        NSString *rewritten = miosRewriteUA(name);
+        NSString *rewritten = miosRewriteWebKitUA(name);
         NSLog(@"[miOS-ua] WKWebViewConfig setApplicationNameForUserAgent in=%@ out=%@", name, rewritten);
         %orig(rewritten);
         return;
     }
     %orig;
+}
+- (NSString *)applicationNameForUserAgent {
+    NSString *name = %orig;
+    if (gDeviceSpoofActive && [name isKindOfClass:[NSString class]] && name.length > 0)
+        return miosRewriteWebKitUA(name);
+    return name;
 }
 %end
 // If the Accounts Center opens in a system Safari view instead of an in-process WKWebView, our

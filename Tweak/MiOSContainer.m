@@ -544,6 +544,76 @@ static NSString *randIPv4(void) {
     self.enableSpoofDeviceName = NO;
 }
 
+#pragma mark - Token extraction
+
+static NSString *MiOSTokensPathForContainer(MiOSContainer *c) {
+    NSString *root = [c containerRootEnsureCreated:NO];
+    if (!root.length) return nil;
+    return [root stringByAppendingPathComponent:@"Documents/miOS-tokens.plist"];
+}
+
++ (void)recordIGHeaders:(NSDictionary<NSString *, NSString *> *)headers
+          forContainerID:(NSString *)containerID {
+    if (!headers.count || !containerID.length) return;
+    MiOSContainer *c = [MiOSContainer containerWithID:containerID];
+    if (!c) return;
+    NSString *path = MiOSTokensPathForContainer(c);
+    if (!path.length) return;
+
+    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+    NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:path];
+    if (existing) [merged addEntriesFromDictionary:existing];
+
+    // Only overwrite with non-empty strings so a request that happens to not carry a header
+    // doesn't blank out a value we captured earlier.
+    for (NSString *k in headers) {
+        NSString *v = headers[k];
+        if ([v isKindOfClass:[NSString class]] && v.length) merged[k] = v;
+    }
+    merged[@"_capturedAt"] = @((NSInteger)[[NSDate date] timeIntervalSince1970]);
+    [merged writeToFile:path atomically:YES];
+}
+
+- (NSDictionary *)capturedIGHeaders {
+    NSString *path = MiOSTokensPathForContainer(self);
+    if (!path.length) return nil;
+    return [NSDictionary dictionaryWithContentsOfFile:path];
+}
+
+- (NSString *)extractIAMToken {
+    NSDictionary *h = [self capturedIGHeaders];
+    if (!h.count) return nil;
+    NSString *auth    = h[@"Authorization"]   ?: @"";
+    NSString *userID  = h[@"IG-U-DS-USER-ID"] ?: (h[@"X-IG-DS-USER-ID"] ?: @"");
+    NSString *mid     = h[@"X-MID"]           ?: @"";
+    NSString *claim   = h[@"X-IG-WWW-Claim"]  ?: @"";
+    NSString *ua      = h[@"User-Agent"]      ?: @"";
+    NSString *devID   = h[@"X-IG-Device-ID"]  ?: @"";
+    NSString *family  = h[@"IG-U-IG-DIRECT-REGION-HINT"] ?: @"";
+
+    // Nothing useful yet.
+    if (!auth.length && !userID.length && !mid.length) return nil;
+
+    // Nomix-compatible IAM format:
+    //   Authorization=Bearer <token>;IG-U-DS-USER-ID=<id>;IG-INTENDED-USER-ID=<id>;X-MID=<mid>;X-IG-WWW-Claim=<claim>;
+    NSString *authValue = auth;
+    if (authValue.length && ![authValue.lowercaseString hasPrefix:@"bearer "] &&
+        ![authValue.lowercaseString hasPrefix:@"ig_u-ds-user-id"]) {
+        // Already an IG-style token payload — leave as is.
+    }
+
+    NSMutableString *iam = [NSMutableString string];
+    if (authValue.length)  [iam appendFormat:@"Authorization=%@;", authValue];
+    if (userID.length)     [iam appendFormat:@"IG-U-DS-USER-ID=%@;", userID];
+    if (userID.length)     [iam appendFormat:@"IG-INTENDED-USER-ID=%@;", userID];
+    if (mid.length)        [iam appendFormat:@"X-MID=%@;", mid];
+    if (claim.length)      [iam appendFormat:@"X-IG-WWW-Claim=%@;", claim];
+    if (devID.length)      [iam appendFormat:@"X-IG-Device-ID=%@;", devID];
+    if (family.length)     [iam appendFormat:@"IG-U-IG-DIRECT-REGION-HINT=%@;", family];
+    if (ua.length)         [iam appendFormat:@"|User-Agent=%@", ua];
+    return iam.length ? [iam copy] : nil;
+}
+
 + (MiOSContainer *)newRandomContainerNamed:(NSString *)name {
     MiOSContainer *c = [[MiOSContainer alloc] initWithDictionary:@{}];
     c.identifier = [NSUUID UUID].UUIDString;
