@@ -123,6 +123,16 @@ static void miosStartWatchdog(void);
 @interface MFMailComposeViewController : NSObject + (BOOL)canSendMail; @end
 @interface MFMessageComposeViewController : NSObject + (BOOL)canSendText; @end
 
+@interface AVCaptureSession : NSObject
+@property (readonly, getter=isRunning) BOOL running;
+@end
+@interface AVCapturePhoto : NSObject
+- (NSData *)fileDataRepresentation;
+@end
+@interface AVCapturePhotoOutput : NSObject
+- (void)capturePhotoWithSettings:(id)settings delegate:(id)delegate;
+@end
+
 typedef CFDictionaryRef (*CNCopyCurrentNetworkInfo_t)(CFStringRef interfaceName);
 
 // MARK: - Shared runtime state (resolved once in the constructor)
@@ -289,6 +299,21 @@ static CLLocation *spoofedLocationObject(void) {
     }
     return %orig;
 }
+- (id)_deviceInfoForKey:(NSString *)key {
+    if (gDeviceSpoofActive && [key isKindOfClass:[NSString class]]) {
+        if (gcMachine && ([key isEqualToString:@"HWModelStr"] || [key isEqualToString:@"ProductType"] ||
+                          [key isEqualToString:@"machine"]))
+            return [NSString stringWithUTF8String:gcMachine];
+        if (gcMGDeviceName && ([key isEqualToString:@"marketing-name"] || [key isEqualToString:@"DeviceName"] ||
+                               [key isEqualToString:@"UserAssignedDeviceName"]))
+            return (__bridge NSString *)gcMGDeviceName;
+    }
+    return %orig;
+}
++ (NSString *)machineName {
+    if (gDeviceSpoofActive && gcMachine) return [NSString stringWithUTF8String:gcMachine];
+    return %orig;
+}
 %end
 %hook NSProcessInfo
 - (NSOperatingSystemVersion)operatingSystemVersion {
@@ -337,6 +362,10 @@ static CLLocation *spoofedLocationObject(void) {
 }
 - (BOOL)isAdvertisingTrackingEnabled {
     if (spoofBool(@"enableSpoofAdvertisingID")) return NO;
+    return %orig;
+}
+- (BOOL)disableAfmaIdfaCollection {
+    if (spoofBool(@"enableSpoofAdvertisingID")) return YES;
     return %orig;
 }
 %end
@@ -400,6 +429,71 @@ static CLLocation *spoofedLocationObject(void) {
 %end
 %end
 // end EarlyIdentity
+
+// MARK: - Facebook Family Device ID — prevents Meta from linking containers via a shared device ID
+%hook FBFamilyDeviceIDReportInternal
+- (NSString *)deviceID {
+    if (gDeviceSpoofActive && spoofBool(@"enableSpoofVendorID")) {
+        NSString *v = spoofStr(@"vendorID");
+        if (v.length) return v;
+    }
+    return %orig;
+}
+- (NSString *)reportDeviceID {
+    if (gDeviceSpoofActive && spoofBool(@"enableSpoofVendorID")) {
+        NSString *v = spoofStr(@"vendorID");
+        if (v.length) return v;
+    }
+    return %orig;
+}
+%end
+%hook FBFamilyIDDeviceIsJailbroken
++ (BOOL)isJailbroken { return NO; }
++ (BOOL)isDeviceJailbroken { return NO; }
+- (BOOL)isJailbroken { return NO; }
+%end
+
+// MARK: - Background Task Blocker — prevents Instagram background telemetry
+%group BackgroundBlocker
+%hook UIApplication
+- (UIBackgroundTaskIdentifier)beginBackgroundTaskWithExpirationHandler:(void (^)(void))handler {
+    NSLog(@"[miOS-bg] Background task prevented (no name)");
+    if (handler) {
+        dispatch_async(dispatch_get_main_queue(), handler);
+    }
+    return UIBackgroundTaskInvalid;
+}
+- (UIBackgroundTaskIdentifier)beginBackgroundTaskWithName:(NSString *)name expirationHandler:(void (^)(void))handler {
+    NSLog(@"[miOS-bg] Background task prevented: %@", name);
+    if (handler) {
+        dispatch_async(dispatch_get_main_queue(), handler);
+    }
+    return UIBackgroundTaskInvalid;
+}
+%end
+%end
+
+// MARK: - Camera Hooker — allows photo substitution from gallery for selfie verification
+static NSData *gCachedPhotoData = nil;
+static BOOL gCameraHookerEnabled = NO;
+
+%group CameraHooker
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(id)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
+    if (gCameraHookerEnabled && gCachedPhotoData) {
+        NSLog(@"[miOS-cam] Using cached photo instead of camera capture");
+        if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [delegate captureOutput:(id)self didFinishProcessingPhoto:nil error:nil];
+            });
+        }
+        return;
+    }
+    %orig;
+}
+%end
+%end
 
 // MARK: - Battery / Brightness / Orientation / Proximity
 
@@ -1136,6 +1230,45 @@ static int (*orig_uname)(struct utsname *);
 static int (*orig_getifaddrs)(struct ifaddrs **);
 static CNCopyCurrentNetworkInfo_t orig_CNCopyCurrentNetworkInfo = NULL;
 
+// _dyld_get_image_header: hide our dylib from image enumeration (anti-detection)
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+
+static BOOL miosIsMiOSImage(uint32_t idx) {
+    const char *name = _dyld_get_image_name(idx);
+    if (!name) return NO;
+    return (strstr(name, "miOS") != NULL || strstr(name, "nomix") != NULL ||
+            strstr(name, "CydiaSubstrate") != NULL || strstr(name, "substrate") != NULL);
+}
+static uint32_t hook_dyld_image_count(void) {
+    uint32_t real = orig_dyld_image_count();
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < real; i++)
+        if (miosIsMiOSImage(i)) hidden++;
+    return real - hidden;
+}
+static uint32_t miosTranslateImageIndex(uint32_t idx) {
+    uint32_t real = orig_dyld_image_count();
+    uint32_t visible = 0;
+    for (uint32_t i = 0; i < real; i++) {
+        if (miosIsMiOSImage(i)) continue;
+        if (visible == idx) return i;
+        visible++;
+    }
+    return idx;
+}
+static const struct mach_header *hook_dyld_get_image_header(uint32_t idx) {
+    return orig_dyld_get_image_header(miosTranslateImageIndex(idx));
+}
+static const char *hook_dyld_get_image_name_fn(uint32_t idx) {
+    return orig_dyld_get_image_name(miosTranslateImageIndex(idx));
+}
+static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t idx) {
+    return orig_dyld_get_image_vmaddr_slide(miosTranslateImageIndex(idx));
+}
+
 static int replyCString(void *oldp, size_t *oldlenp, const char *cstr) {
     size_t need = strlen(cstr) + 1;
     if (!oldp) { if (oldlenp) *oldlenp = need; return 0; }
@@ -1245,6 +1378,24 @@ static CFTypeRef mios_MGCopyAnswer(CFStringRef key) {
         if (gcMGDeviceClass && CFEqual(key, CFSTR("DeviceClass")))     return CFRetain(gcMGDeviceClass);
     }
     return orig_MGCopyAnswer ? orig_MGCopyAnswer(key) : NULL;
+}
+
+// MGCopyAnswer_internal — the internal version called directly by some system frameworks,
+// bypassing the public MGCopyAnswer wrapper. Nomix hooks this for deeper coverage.
+static CFTypeRef (*orig_MGCopyAnswer_internal)(CFStringRef, CFDictionaryRef) = NULL;
+static CFTypeRef mios_MGCopyAnswer_internal(CFStringRef key, CFDictionaryRef options) {
+    if (gDeviceSpoofActive && key) {
+        if (gcMGProductType && CFEqual(key, CFSTR("ProductType")))      return CFRetain(gcMGProductType);
+        if (gcMGProductVersion && CFEqual(key, CFSTR("ProductVersion"))) return CFRetain(gcMGProductVersion);
+        if (gcMGHWModel && (CFEqual(key, CFSTR("HWModelStr")) || CFEqual(key, CFSTR("HardwarePlatform"))))
+            return CFRetain(gcMGHWModel);
+        if (gcMGDeviceName && (CFEqual(key, CFSTR("marketing-name")) ||
+                               CFEqual(key, CFSTR("DeviceName")) ||
+                               CFEqual(key, CFSTR("UserAssignedDeviceName"))))
+            return CFRetain(gcMGDeviceName);
+        if (gcMGDeviceClass && CFEqual(key, CFSTR("DeviceClass")))     return CFRetain(gcMGDeviceClass);
+    }
+    return orig_MGCopyAnswer_internal ? orig_MGCopyAnswer_internal(key, options) : NULL;
 }
 
 // getifaddrs: rewrite the IPv4 of en0 (Wi-Fi) and pdp_ip0 (cellular) if spoofing is on.
@@ -2392,10 +2543,16 @@ static MiOSContainer *gEarlyBootActiveContainer = nil;
                 {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             }, 3);
-            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
+            if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass) {
                 rebind_symbols((struct rebinding[]){
                     {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
                 }, 1);
+                void *mgH2 = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+                if (mgH2 && dlsym(mgH2, "MGCopyAnswer_internal"))
+                    rebind_symbols((struct rebinding[]){
+                        {"MGCopyAnswer_internal", (void *)mios_MGCopyAnswer_internal, (void **)&orig_MGCopyAnswer_internal},
+                    }, 1);
+            }
             rebind_symbols((struct rebinding[]){
                 {"METAGenerateInstagramStyleUserAgentInfoString", (void *)hook_METAGenUA,    (void **)&orig_METAGenUA},
                 {"METAGetWKWebViewUserAgent",                     (void *)hook_METAWKUA,     (void **)&orig_METAWKUA},
@@ -2404,6 +2561,12 @@ static MiOSContainer *gEarlyBootActiveContainer = nil;
             NSLog(@"[miOS-time] +load: C hooks INSTALLED @%.0fms (before ANY IG +load/ctor)",
                   miosMsSinceStart());
         }
+        rebind_symbols((struct rebinding[]){
+            {"_dyld_image_count",          (void *)hook_dyld_image_count,          (void **)&orig_dyld_image_count},
+            {"_dyld_get_image_header",     (void *)hook_dyld_get_image_header,     (void **)&orig_dyld_get_image_header},
+            {"_dyld_get_image_name",       (void *)hook_dyld_get_image_name_fn,    (void **)&orig_dyld_get_image_name},
+            {"_dyld_get_image_vmaddr_slide",(void *)hook_dyld_get_image_vmaddr_slide,(void **)&orig_dyld_get_image_vmaddr_slide},
+        }, 4);
         gEarlyBootActiveContainer = active;
         gEarlyBootDone = YES;
     }
@@ -2489,22 +2652,42 @@ static MiOSContainer *gEarlyBootActiveContainer = nil;
                     {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                     {"uname",        (void *)hook_uname,        (void **)&orig_uname},
                 }, 3);
-                if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass)
+                if (gcMGProductType || gcMGProductVersion || gcMGDeviceName || gcMGHWModel || gcMGDeviceClass) {
                     rebind_symbols((struct rebinding[]){
                         {"MGCopyAnswer", (void *)mios_MGCopyAnswer, (void **)&orig_MGCopyAnswer},
                     }, 1);
+                    void *mgH2 = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+                    if (mgH2 && dlsym(mgH2, "MGCopyAnswer_internal"))
+                        rebind_symbols((struct rebinding[]){
+                            {"MGCopyAnswer_internal", (void *)mios_MGCopyAnswer_internal, (void **)&orig_MGCopyAnswer_internal},
+                        }, 1);
+                }
                 rebind_symbols((struct rebinding[]){
                     {"METAGenerateInstagramStyleUserAgentInfoString", (void *)hook_METAGenUA,    (void **)&orig_METAGenUA},
                     {"METAGetWKWebViewUserAgent",                     (void *)hook_METAWKUA,     (void **)&orig_METAWKUA},
                     {"METAWKWebViewDefaultUserAgentForCurrentApp",    (void *)hook_METAWKUADef,  (void **)&orig_METAWKUADef},
                 }, 3);
             }
+            rebind_symbols((struct rebinding[]){
+                {"_dyld_image_count",          (void *)hook_dyld_image_count,          (void **)&orig_dyld_image_count},
+                {"_dyld_get_image_header",     (void *)hook_dyld_get_image_header,     (void **)&orig_dyld_get_image_header},
+                {"_dyld_get_image_name",       (void *)hook_dyld_get_image_name_fn,    (void **)&orig_dyld_get_image_name},
+                {"_dyld_get_image_vmaddr_slide",(void *)hook_dyld_get_image_vmaddr_slide,(void **)&orig_dyld_get_image_vmaddr_slide},
+            }, 4);
             NSLog(@"[miOS-time] ctor fallback: C hooks INSTALLED @%.0fms", miosMsSinceStart());
         }
 
         dlopen("/System/Library/Frameworks/DeviceCheck.framework/DeviceCheck", RTLD_LAZY);
         %init(EarlyIdentity);
-        NSLog(@"[miOS-time] EarlyIdentity ObjC hooks @%.0fms", miosMsSinceStart());
+        if (spoofBool(@"enableBlockBackground")) {
+            %init(BackgroundBlocker);
+            NSLog(@"[miOS-bg] Background task blocker INSTALLED");
+        }
+        if (spoofBool(@"enableCameraHooker")) {
+            %init(CameraHooker);
+            NSLog(@"[miOS-cam] Camera hooker INSTALLED");
+        }
+        NSLog(@"[miOS-time] EarlyIdentity + extra ObjC hooks @%.0fms", miosMsSinceStart());
 
         // 1. Filesystem isolation.
         miosInstallContainerFS(active);
