@@ -190,15 +190,37 @@ static double    spoofDbl(NSString *key)   { return [gSpoof[key] doubleValue]; }
 
 // MARK: - Location
 
-static BOOL locationSpoofEnabled(void) { return spoofBool(@"spoofLocation"); }
+// Location reads the LIVE container state, not gSpoof, so changes made in the Location
+// editor take effect immediately without an app restart.
+static BOOL locationSpoofEnabled(void) {
+    @try {
+        MiOSContainer *c = [MiOSContainer containerWithID:gContainerUUID];
+        if (c) return c.spoofLocation;
+    } @catch (__unused id e) {}
+    return spoofBool(@"spoofLocation");
+}
 static CLLocationCoordinate2D spoofedCoordinate(void) {
+    @try {
+        MiOSContainer *c = [MiOSContainer containerWithID:gContainerUUID];
+        if (c && (c.coordinate.latitude != 0 || c.coordinate.longitude != 0))
+            return c.coordinate;
+    } @catch (__unused id e) {}
     return CLLocationCoordinate2DMake(spoofDbl(@"latitude"), spoofDbl(@"longitude"));
 }
 static CLLocation *spoofedLocationObject(void) {
-    double acc = spoofDbl(@"horizontalAccuracy"); if (acc <= 0) acc = 5.0;
-    double alt = spoofDbl(@"altitude");
-    double spd = spoofDbl(@"speed"); double crs = spoofDbl(@"course");
-    return [[CLLocation alloc] initWithCoordinate:spoofedCoordinate()
+    CLLocationCoordinate2D coord = spoofedCoordinate();
+    double acc = 5.0, alt = 0, spd = -1, crs = -1;
+    @try {
+        MiOSContainer *c = [MiOSContainer containerWithID:gContainerUUID];
+        if (c) {
+            acc = c.horizontalAccuracy > 0 ? c.horizontalAccuracy : 5.0;
+            alt = c.altitude; spd = c.speed; crs = c.course;
+        }
+    } @catch (__unused id e) {
+        acc = spoofDbl(@"horizontalAccuracy"); if (acc <= 0) acc = 5.0;
+        alt = spoofDbl(@"altitude"); spd = spoofDbl(@"speed"); crs = spoofDbl(@"course");
+    }
+    return [[CLLocation alloc] initWithCoordinate:coord
                                          altitude:alt horizontalAccuracy:acc verticalAccuracy:acc
                                            course:(crs ?: -1) speed:(spd ?: -1) timestamp:[NSDate date]];
 }
@@ -643,31 +665,52 @@ static NSData *miosRewriteHTTPBody(NSData *body);   // defined after the device-
 // action. We only save when values actually change to keep writes rare.
 static NSMutableDictionary<NSString *, NSString *> *gLastCapturedIGHeaders = nil;
 static NSTimeInterval gLastCapturedIGSave = 0;
+static BOOL gIGHeadersEverSaved = NO;
+
+static NSArray *miosCaptureKeys(void) {
+    static NSArray *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"Authorization", @"IG-U-DS-USER-ID", @"X-IG-DS-USER-ID",
+                 @"X-MID", @"X-IG-WWW-Claim", @"X-IG-Device-ID",
+                 @"User-Agent", @"IG-U-IG-DIRECT-REGION-HINT",
+                 @"X-IG-Family-Device-ID", @"X-Bloks-Version-Id"];
+    });
+    return keys;
+}
+static BOOL miosIsIGHost(NSString *host) {
+    if (!host.length) return NO;
+    return [host hasSuffix:@"instagram.com"] || [host hasSuffix:@"cdninstagram.com"] ||
+           [host hasSuffix:@"facebook.com"] || [host containsString:@"fbcdn"];
+}
+static void miosFlushCapturedHeaders(BOOL force) {
+    if (!gLastCapturedIGHeaders.count) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (!force && gIGHeadersEverSaved && now - gLastCapturedIGSave < 10.0) return;
+    gLastCapturedIGSave = now;
+    gIGHeadersEverSaved = YES;
+    NSString *cid = gContainerUUID;
+    if (!cid.length) return;
+    NSDictionary *snapshot = [gLastCapturedIGHeaders copy];
+    static int lg = 0; if (lg < 8) { lg++;
+        NSLog(@"[miOS-tok] SAVING %lu headers for container=%@ (keys=%@)",
+              (unsigned long)snapshot.count, cid, snapshot.allKeys); }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [MiOSContainer recordIGHeaders:snapshot forContainerID:cid];
+    });
+}
 static void miosCaptureIGHeaders(NSURLRequest *req) {
     @try {
         if (!req) return;
         NSString *host = req.URL.host.lowercaseString;
-        if (!host.length) return;
-        // Instagram API hosts only — avoids spam from third-party SDKs / Meta Analytics.
-        if (!([host hasSuffix:@"instagram.com"] || [host hasSuffix:@"cdninstagram.com"] ||
-              [host containsString:@"i.instagram.com"] || [host containsString:@"b.i.instagram.com"] ||
-              [host containsString:@"graph.instagram.com"])) return;
+        if (!miosIsIGHost(host)) return;
 
         NSDictionary *hdrs = req.allHTTPHeaderFields;
         if (!hdrs.count) return;
 
-        static NSArray *keys = nil;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            keys = @[@"Authorization", @"IG-U-DS-USER-ID", @"X-IG-DS-USER-ID",
-                     @"X-MID", @"X-IG-WWW-Claim", @"X-IG-Device-ID",
-                     @"User-Agent", @"IG-U-IG-DIRECT-REGION-HINT",
-                     @"X-IG-Family-Device-ID", @"X-Bloks-Version-Id"];
-        });
-
         if (!gLastCapturedIGHeaders) gLastCapturedIGHeaders = [NSMutableDictionary dictionary];
         BOOL changed = NO;
-        for (NSString *k in keys) {
+        for (NSString *k in miosCaptureKeys()) {
             NSString *v = hdrs[k];
             if (![v isKindOfClass:[NSString class]] || !v.length) continue;
             NSString *cur = gLastCapturedIGHeaders[k];
@@ -677,18 +720,32 @@ static void miosCaptureIGHeaders(NSURLRequest *req) {
             }
         }
         if (!changed) return;
-
-        // Throttle disk writes to once every 10s even if things keep changing.
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - gLastCapturedIGSave < 10.0) return;
-        gLastCapturedIGSave = now;
-
-        NSString *cid = gContainerUUID;
-        if (!cid.length) return;
-        NSDictionary *snapshot = [gLastCapturedIGHeaders copy];
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            [MiOSContainer recordIGHeaders:snapshot forContainerID:cid];
-        });
+        miosFlushCapturedHeaders(!gIGHeadersEverSaved);
+    } @catch (__unused id e) {}
+}
+// Capture individual header set via NSMutableURLRequest setValue:forHTTPHeaderField:
+// IG builds requests incrementally — Authorization etc. are often set AFTER the request
+// object is created, so allHTTPHeaderFields at dataTaskWithRequest: time may be incomplete.
+static void miosCaptureOneHeader(NSURLRequest *req, NSString *field, NSString *value) {
+    @try {
+        if (!req || !field.length || !value.length) return;
+        NSString *host = req.URL.host.lowercaseString;
+        if (!miosIsIGHost(host)) return;
+        for (NSString *k in miosCaptureKeys()) {
+            if ([field caseInsensitiveCompare:k] == NSOrderedSame) {
+                if (!gLastCapturedIGHeaders) gLastCapturedIGHeaders = [NSMutableDictionary dictionary];
+                NSString *cur = gLastCapturedIGHeaders[k];
+                if (![cur isEqualToString:value]) {
+                    gLastCapturedIGHeaders[k] = value;
+                    static int lg = 0; if (lg < 20) { lg++;
+                        NSLog(@"[miOS-tok] captured header %@=%@ (from setValue:forHTTPHeaderField:)",
+                              k, [k caseInsensitiveCompare:@"Authorization"] == NSOrderedSame
+                              ? [value substringToIndex:MIN(20u, value.length)] : value); }
+                    miosFlushCapturedHeaders(!gIGHeadersEverSaved);
+                }
+                return;
+            }
+        }
     } @catch (__unused id e) {}
 }
 
@@ -2583,6 +2640,7 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
     %orig(rewritten);
 }
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    miosCaptureOneHeader(self, field, value);
     if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
         [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
         NSString *nv = miosRewriteUA(value);
@@ -2592,6 +2650,7 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
     %orig;
 }
 - (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    miosCaptureOneHeader(self, field, value);
     if (gDeviceSpoofActive && [field isKindOfClass:[NSString class]] &&
         [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
         NSString *nv = miosRewriteUA(value);
@@ -2601,6 +2660,7 @@ static NSString *hook_METAWKUADef(void *a0, void *a1, void *a2, void *a3) {
     %orig;
 }
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headers {
+    @try { miosCaptureIGHeaders(self); } @catch (__unused id e) {}
     if (gDeviceSpoofActive && [headers isKindOfClass:[NSDictionary class]]) {
         NSMutableDictionary *m = [headers mutableCopy];
         for (NSString *k in headers) {

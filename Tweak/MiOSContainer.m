@@ -547,7 +547,7 @@ static NSString *randIPv4(void) {
 #pragma mark - Token extraction
 
 static NSString *MiOSTokensPathForContainer(MiOSContainer *c) {
-    NSString *root = [c containerRootEnsureCreated:NO];
+    NSString *root = [c containerRootEnsureCreated:YES];
     if (!root.length) return nil;
     return [root stringByAppendingPathComponent:@"Documents/miOS-tokens.plist"];
 }
