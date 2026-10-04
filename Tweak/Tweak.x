@@ -124,15 +124,7 @@ static void miosStartWatchdog(void);
 @interface MFMailComposeViewController : NSObject + (BOOL)canSendMail; @end
 @interface MFMessageComposeViewController : NSObject + (BOOL)canSendText; @end
 
-@interface AVCaptureSession : NSObject
-@property (readonly, getter=isRunning) BOOL running;
-@end
-@interface AVCapturePhoto : NSObject
-- (NSData *)fileDataRepresentation;
-@end
-@interface AVCapturePhotoOutput : NSObject
-- (void)capturePhotoWithSettings:(id)settings delegate:(id)delegate;
-@end
+// AVCaptureSession, AVCapturePhoto, AVCapturePhotoOutput provided by AVFoundation.h
 
 typedef CFDictionaryRef (*CNCopyCurrentNetworkInfo_t)(CFStringRef interfaceName);
 
@@ -490,7 +482,10 @@ static BOOL gCameraHookerEnabled = NO;
             __weak AVCapturePhotoOutput *weakSelf = (AVCapturePhotoOutput *)self;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnonnull"
                 [delegate captureOutput:weakSelf didFinishProcessingPhoto:nil error:nil];
+#pragma clang diagnostic pop
             });
         }
         return;
