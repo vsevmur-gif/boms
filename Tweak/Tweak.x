@@ -6,6 +6,7 @@
 #import <SafariServices/SafariServices.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <sys/sysctl.h>
 #import <sys/utsname.h>
@@ -2814,7 +2815,79 @@ static MiOSContainer *gEarlyBootActiveContainer = nil;
                       spoofStr(@"deviceIdentifier"), spoofStr(@"deviceDisplayName"));
                 if (pt) CFRelease(pt);
                 if (mn) CFRelease(mn);
-            } @catch (__unused id e) {}
+
+                // --- Identity IDs ---
+                NSUUID *vid = [UIDevice currentDevice].identifierForVendor;
+                NSString *wantVendor = spoofStr(@"vendorID");
+                NSLog(@"[miOS-iso] SELFTEST identifierForVendor=%@  want=%@  (%@)",
+                      vid.UUIDString, wantVendor.length ? wantVendor : @"(n/a)",
+                      (wantVendor.length && [vid.UUIDString.lowercaseString isEqualToString:wantVendor.lowercaseString]) ? @"WORKS" : @"check manually");
+
+                Class asiClass = NSClassFromString(@"ASIdentifierManager");
+                if (asiClass) {
+                    id mgr = [asiClass performSelector:@selector(sharedManager)];
+                    NSUUID *adid = [mgr performSelector:@selector(advertisingIdentifier)];
+                    NSString *wantAd = spoofStr(@"advertisingID");
+                    BOOL tracking = [[mgr valueForKey:@"advertisingTrackingEnabled"] boolValue];
+                    NSLog(@"[miOS-iso] SELFTEST advertisingID=%@  want=%@  tracking=%d  (%@)",
+                          adid.UUIDString, wantAd.length ? wantAd : @"(n/a)", tracking,
+                          spoofBool(@"enableSpoofAdvertisingID") ? @"spoofing ON" : @"passthrough");
+                } else {
+                    NSLog(@"[miOS-iso] SELFTEST ASIdentifierManager not loaded (ok for iOS 14.5+)");
+                }
+
+                // --- FBFamily device ID ---
+                Class fbFamily = NSClassFromString(@"FBFamilyDeviceIDReportInternal");
+                NSLog(@"[miOS-iso] SELFTEST FBFamilyDeviceIDReportInternal class=%@ (%@)",
+                      fbFamily ? @"loaded" : @"not loaded",
+                      fbFamily ? @"hook active" : @"hook waiting for class load");
+
+                // --- FBFamily jailbreak ---
+                Class fbJB = NSClassFromString(@"FBFamilyIDDeviceIsJailbroken");
+                if (fbJB) {
+                    BOOL jb = NO;
+                    @try { jb = ((BOOL (*)(id, SEL))objc_msgSend)(fbJB, @selector(isJailbroken)); } @catch(__unused id e) {}
+                    NSLog(@"[miOS-iso] SELFTEST FBFamilyIDDeviceIsJailbroken.isJailbroken=%d  want=0  (%@)",
+                          jb, jb == NO ? @"WORKS" : @"NOT firing");
+                } else {
+                    NSLog(@"[miOS-iso] SELFTEST FBFamilyIDDeviceIsJailbroken not loaded yet");
+                }
+
+                // --- uname ---
+                struct utsname uts;
+                uname(&uts);
+                NSLog(@"[miOS-iso] SELFTEST uname.machine=%s  uname.sysname=%s  want=%@  (%@)",
+                      uts.machine, uts.sysname, wantModel.length ? wantModel : @"(n/a)",
+                      (wantModel.length && strcmp(uts.machine, wantModel.UTF8String) == 0) ? @"WORKS" : @"NOT firing");
+
+                // --- NSProcessInfo ---
+                NSOperatingSystemVersion osv = [[NSProcessInfo processInfo] operatingSystemVersion];
+                unsigned long long physMem = [NSProcessInfo processInfo].physicalMemory;
+                NSUInteger cpuCount = [NSProcessInfo processInfo].processorCount;
+                NSLog(@"[miOS-iso] SELFTEST NSProcessInfo osVersion=%ld.%ld.%ld  physMem=%llu  cpuCount=%lu",
+                      (long)osv.majorVersion, (long)osv.minorVersion, (long)osv.patchVersion,
+                      physMem, (unsigned long)cpuCount);
+
+                // --- dyld hiding ---
+                uint32_t visibleCount = _dyld_image_count();
+                uint32_t realCount = orig_dyld_image_count ? orig_dyld_image_count() : visibleCount;
+                uint32_t hiddenCount = realCount - visibleCount;
+                NSLog(@"[miOS-iso] SELFTEST dyld images: visible=%u  real=%u  hidden=%u  (%@)",
+                      visibleCount, realCount, hiddenCount,
+                      hiddenCount > 0 ? @"WORKS" : (orig_dyld_image_count ? @"no tweak libs found" : @"hook not installed"));
+
+                // --- Summary ---
+                NSLog(@"[miOS-iso] SELFTEST === SUMMARY ===");
+                NSLog(@"[miOS-iso] SELFTEST deviceSpoof=%d  vendorSpoof=%d  adIDSpoof=%d  swSpoof=%d  bgBlock=%d  camHook=%d",
+                      (int)gDeviceSpoofActive,
+                      (int)spoofBool(@"enableSpoofVendorID"),
+                      (int)spoofBool(@"enableSpoofAdvertisingID"),
+                      (int)spoofBool(@"enableSpoofSoftwareVersion"),
+                      (int)spoofBool(@"enableBlockBackground"),
+                      (int)gCameraHookerEnabled);
+            } @catch (__unused id e) {
+                NSLog(@"[miOS-iso] SELFTEST exception: %@", e);
+            }
         });
 
         miosLog(@"ctor complete — all hooks installed (deviceSpoof=%d)", (int)gDeviceSpoofActive);
