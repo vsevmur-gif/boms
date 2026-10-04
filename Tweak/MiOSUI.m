@@ -856,7 +856,7 @@ static void MiOSRandomizeCarrierInCountry(MiOSContainer *m) {
 - (void)_randomizeModuleSheet {
     MiOSContainer *m = self.container; __weak typeof(self) ws = self;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Randomize module" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSString *mm in @[@"device", @"identifiers", @"carrier", @"wifi", @"cellular", @"locale", @"kernel", @"battery", @"brightness", @"gyroscope"]) {
+    for (NSString *mm in @[@"device", @"identifiers", @"carrier", @"wifi", @"cellular", @"locale", @"location", @"kernel", @"battery", @"brightness", @"gyroscope"]) {
         [a addAction:[UIAlertAction actionWithTitle:mm style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [m randomizeModule:mm]; [ws save]; [ws reload]; }]];
     }
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];

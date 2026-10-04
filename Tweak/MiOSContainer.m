@@ -448,6 +448,49 @@ static NSString *randIPv4(void) {
     self.enableSpoofTimeZone = YES; self.timeZoneID = l[1];
 }
 
+- (void)randomizeLocation {
+    static NSArray *cities = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cities = @[
+            @[@"New York",      @(40.7128),  @(-74.0060),  @"US"],
+            @[@"Los Angeles",   @(34.0522),  @(-118.2437), @"US"],
+            @[@"London",        @(51.5074),  @(-0.1278),   @"GB"],
+            @[@"Paris",         @(48.8566),  @(2.3522),    @"FR"],
+            @[@"Berlin",        @(52.5200),  @(13.4050),   @"DE"],
+            @[@"Moscow",        @(55.7558),  @(37.6173),   @"RU"],
+            @[@"Tokyo",         @(35.6762),  @(139.6503),  @"JP"],
+            @[@"Sydney",        @(-33.8688), @(151.2093),  @"AU"],
+            @[@"São Paulo",     @(-23.5505), @(-46.6333),  @"BR"],
+            @[@"Dubai",         @(25.2048),  @(55.2708),   @"AE"],
+            @[@"Toronto",       @(43.6532),  @(-79.3832),  @"CA"],
+            @[@"Madrid",        @(40.4168),  @(-3.7038),   @"ES"],
+            @[@"Rome",          @(41.9028),  @(12.4964),   @"IT"],
+            @[@"Seoul",         @(37.5665),  @(126.9780),  @"KR"],
+            @[@"Singapore",     @(1.3521),   @(103.8198),  @"SG"],
+            @[@"Istanbul",      @(41.0082),  @(28.9784),   @"TR"],
+            @[@"Bangkok",       @(13.7563),  @(100.5018),  @"TH"],
+            @[@"Mexico City",   @(19.4326),  @(-99.1332),  @"MX"],
+            @[@"Amsterdam",     @(52.3676),  @(4.9041),    @"NL"],
+            @[@"Stockholm",     @(59.3293),  @(18.0686),   @"SE"],
+        ];
+    });
+    NSArray *c = cities[rnd((uint32_t)cities.count)];
+    double jitterLat = ((double)rnd(2000) - 1000) / 10000.0;
+    double jitterLon = ((double)rnd(2000) - 1000) / 10000.0;
+    self.spoofLocation = YES;
+    self.coordinate = (CLLocationCoordinate2D){
+        [c[1] doubleValue] + jitterLat,
+        [c[2] doubleValue] + jitterLon
+    };
+    self.altitude = 10.0 + (double)rnd(200);
+    self.horizontalAccuracy = 5.0;
+    self.speed = -1;
+    self.course = -1;
+    self.locationName = c[0];
+    self.locationCountryCode = c[3];
+}
+
 - (void)randomizeCellular {
     self.enableSpoofCellular = YES; self.cellularAddress = randIPv4();
     self.enableSpoofCellularType = YES;
@@ -465,6 +508,7 @@ static NSString *randIPv4(void) {
     else if ([key isEqualToString:@"cellular"]) [self randomizeCellular];
     else if ([key isEqualToString:@"locale"]) [self randomizeLocale];
     else if ([key isEqualToString:@"kernel"]) [self randomizeKernelVersion];
+    else if ([key isEqualToString:@"location"]) [self randomizeLocation];
     else if ([key isEqualToString:@"battery"]) {
         self.enableSpoofBatteryLevel = YES;
         self.batteryLevel = 20 + (NSInteger)rnd(80);
@@ -486,6 +530,7 @@ static NSString *randIPv4(void) {
     [self randomizeCarrier];
     [self randomizeWiFi];
     [self randomizeLocale];
+    [self randomizeLocation];
     [self randomizeModule:@"battery"];
     [self randomizeModule:@"brightness"];
     self.enableSpoofGyroscope = YES;
